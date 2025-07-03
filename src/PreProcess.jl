@@ -18,7 +18,6 @@ function LoadSpecificCSV(::Val{D}, ::Type{T}, particle_type::ParticleType, parti
     density      = Vector{T}(undef, nrows)
     types        = Vector{ParticleType}(undef, nrows)
     group_marker = Vector{Int}(undef, nrows)
-    idp          = Vector{Int}(undef, nrows)
 
     i = 1
     for DF ∈ eachrow(DF_SPECIFIC)
@@ -26,7 +25,6 @@ function LoadSpecificCSV(::Val{D}, ::Type{T}, particle_type::ParticleType, parti
         P2   = DF["Points:1"]
         P3   = DF["Points:2"]
         Rhop = DF["Rhop"]
-        Idp  = DF["Idp"] + 1
 
         points[i] = if D == 3
             SVector{3,T}(P1, P2, P3)
@@ -37,11 +35,10 @@ function LoadSpecificCSV(::Val{D}, ::Type{T}, particle_type::ParticleType, parti
         density[i]      = Rhop
         types[i]        = particle_type
         group_marker[i] = particle_group_marker
-        idp[i]          = Idp
         i += 1
     end
 
-    return points, density, types, group_marker, idp
+    return points, density, types, group_marker
 end
 
 function AllocateDataStructures(SimGeometry::Vector{<:Geometry{Dimensions, FloatType}}) where {Dimensions, FloatType}
@@ -49,14 +46,13 @@ function AllocateDataStructures(SimGeometry::Vector{<:Geometry{Dimensions, Float
     Density     = Vector{FloatType}()
     Types       = Vector{ParticleType}()
     GroupMarker = Vector{UInt}()
-    Idp         = Vector{Int}()
     
     for geom in SimGeometry
         particle_type         = geom.Type
         particle_group_marker = geom.GroupMarker
         specific_csv          = geom.CSVFile
 
-        points, density, types, group_marker, idp =
+        points, density, types, group_marker =
             LoadSpecificCSV(Val(Dimensions), FloatType, particle_type,
                            particle_group_marker, specific_csv)
 
@@ -64,13 +60,11 @@ function AllocateDataStructures(SimGeometry::Vector{<:Geometry{Dimensions, Float
         sizehint!(Density,     length(Density)     + length(density))
         sizehint!(Types,       length(Types)       + length(types))
         sizehint!(GroupMarker, length(GroupMarker) + length(group_marker))
-        sizehint!(Idp,         length(Idp)         + length(idp))
 
         append!(Position,    points)
         append!(Density,     density)
         append!(Types,       types)
         append!(GroupMarker, group_marker)
-        append!(Idp,         idp)
     end
 
     NumberOfPoints           = length(Position)
@@ -99,23 +93,29 @@ function AllocateDataStructures(SimGeometry::Vector{<:Geometry{Dimensions, Float
         MotionLimiter[i] = fac
     end
 
-    BoundaryBool  = UInt8.(.!Bool.(MotionLimiter))
-
     Acceleration    = zeros(PositionType, NumberOfPoints)
     Velocity        = zeros(PositionType, NumberOfPoints)
-    Kernel          = zeros(PositionUnderlyingType, NumberOfPoints)
-    KernelGradient  = zeros(PositionType, NumberOfPoints)
     GhostPoints     = zeros(PositionType, NumberOfPoints)
     GhostNormals    = zeros(PositionType, NumberOfPoints)
 
     Pressureᵢ      = zeros(PositionUnderlyingType, NumberOfPoints)
     
-    Cells          = fill(zero(CartesianIndex{Dimensions}), NumberOfPoints)
-    ChunkID        = zeros(Int, NumberOfPoints)
+    Cells = fill(zero(CartesianIndex{Dimensions}), NumberOfPoints)
 
-    SimParticles = StructArray((Cells = Cells, ChunkID = ChunkID, Kernel = Kernel, KernelGradient = KernelGradient, Position=Position, Acceleration=Acceleration, Velocity=Velocity, Density=Density, Pressure=Pressureᵢ, GravityFactor=GravityFactor, MotionLimiter=MotionLimiter, BoundaryBool = BoundaryBool, ID = Idp , Type = Types, GroupMarker = GroupMarker, GhostPoints = GhostPoints, GhostNormals=GhostNormals))
-
-    sort!(SimParticles, by = p -> p.ID)
+    SimParticles = StructArray((
+        Cells = Cells,
+        Position = Position,
+        Acceleration = Acceleration,
+        Velocity = Velocity,
+        Density = Density,
+        Pressure = Pressureᵢ,
+        GravityFactor = GravityFactor,
+        MotionLimiter = MotionLimiter,
+        Type = Types,
+        GroupMarker = GroupMarker,
+        GhostPoints = GhostPoints,
+        GhostNormals = GhostNormals,
+    ))
 
     return SimParticles
 end
@@ -141,21 +141,14 @@ function AllocateThreadedArrays(SimMetaData, SimParticles, dρdtI, ∇Cᵢ, ∇�
     
         
     dρdtIThreaded        = [copy(dρdtI) for _ in 1:n_copy]
-    AccelerationThreaded = [copy(SimParticles.KernelGradient) for _ in 1:n_copy]
+    AccelerationThreaded = [copy(SimParticles.Acceleration) for _ in 1:n_copy]
 
     nt = (
         dρdtIThreaded = dρdtIThreaded,
         AccelerationThreaded = AccelerationThreaded,
     )
 
-    if SimMetaData.FlagOutputKernelValues
-        KernelThreaded         = [copy(SimParticles.Kernel) for _ in 1:n_copy]
-        KernelGradientThreaded = [copy(SimParticles.KernelGradient) for _ in 1:n_copy]
-        nt = merge(nt, (
-            KernelThreaded = KernelThreaded,
-            KernelGradientThreaded = KernelGradientThreaded,
-        ))
-    end
+    # Kernel values are omitted in the minimal build
 
     if SimMetaData.FlagShifting
         ∇CᵢThreaded  = [copy(∇Cᵢ) for _ in 1:n_copy]

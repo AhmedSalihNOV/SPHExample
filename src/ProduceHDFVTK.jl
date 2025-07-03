@@ -207,7 +207,6 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
             CellData = HDF5.create_group(root, "CellData")
             HDF5.create_dataset(CellData, "CellData" , idType , ((0,),(-1,)), chunk=(chunk_size,))
 
-            HDF5.create_dataset(CellData, "ChunkID" , idType , ((0,),(-1,)), chunk=(chunk_size,))
         end
 
         return nothing
@@ -406,9 +405,7 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
         root["CellData"]["CellData"][CellDataStartIndex:end] = cell_data
 
         
-        CellChunkIDIndex = length(root["CellData"]["ChunkID"]) + 1
-        HDF5.set_extent_dims(root["CellData"]["ChunkID"], (length(root["CellData"]["ChunkID"]) + length(UniqueCells),))
-        root["CellData"]["ChunkID"][CellChunkIDIndex:end] = SimParticles.ChunkID[1:length(cell_data)]
+
 
         return nothing
     end
@@ -487,15 +484,10 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
             root = HDF5.create_group(OutputVTKHDF, "VTKHDF")
             
             available_init = Dict(
-                "ChunkID" => SimParticles.ChunkID,
-                "Kernel" => SimParticles.Kernel,
-                "KernelGradient" => SimParticles.KernelGradient,
                 "Density" => SimParticles.Density,
                 "Pressure" => SimParticles.Pressure,
                 "Velocity" => SimParticles.Velocity,
                 "Acceleration" => SimParticles.Acceleration,
-                "BoundaryBool" => SimParticles.BoundaryBool,
-                "ID" => SimParticles.ID,
                 "Type" => Int8.(SimParticles.Type),
                 "GroupMarker" => SimParticles.GroupMarker,
                 "GhostPoints" => SimParticles.GhostPoints,
@@ -520,19 +512,17 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
         end
 
         # Buffers used when converting 2D particle data to 3D
-        pos_buf = kgrad_buf = vel_buf = acc_buf = gp_buf = gn_buf = nothing
+        pos_buf = vel_buf = acc_buf = gp_buf = gn_buf = nothing
         if Dimensions == 2
             T = eltype(eltype(SimParticles.Position))
             n = length(SimParticles.Position)
             pos_buf   = Vector{SVector{3,T}}(undef, n)
-            kgrad_buf = Vector{SVector{3,T}}(undef, n)
             vel_buf   = Vector{SVector{3,T}}(undef, n)
             acc_buf   = Vector{SVector{3,T}}(undef, n)
             gp_buf    = Vector{SVector{3,T}}(undef, n)
             gn_buf    = Vector{SVector{3,T}}(undef, n)
             fill_buffers!() = begin
                 to_3d!(pos_buf,   SimParticles.Position)
-                to_3d!(kgrad_buf, SimParticles.KernelGradient)
                 to_3d!(vel_buf,   SimParticles.Velocity)
                 to_3d!(acc_buf,   SimParticles.Acceleration)
                 to_3d!(gp_buf,    SimParticles.GhostPoints)
@@ -545,14 +535,12 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
             if Dimensions == 2
                 fill_buffers!()
                 pos   = pos_buf
-                kgrad = kgrad_buf
                 vel   = vel_buf
                 acc   = acc_buf
                 gp    = gp_buf
                 gn    = gn_buf
             else
                 pos = SimParticles.Position
-                kgrad = SimParticles.KernelGradient
                 vel = SimParticles.Velocity
                 acc = SimParticles.Acceleration
                 gp  = SimParticles.GhostPoints
@@ -560,15 +548,10 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
             end
 
             available = Dict(
-                "ChunkID" => SimParticles.ChunkID,
-                "Kernel" => SimParticles.Kernel,
-                "KernelGradient" => kgrad,
                 "Density" => SimParticles.Density,
                 "Pressure" => SimParticles.Pressure,
                 "Velocity" => vel,
                 "Acceleration" => acc,
-                "BoundaryBool" => SimParticles.BoundaryBool,
-                "ID" => SimParticles.ID,
                 "Type" => Int8.(SimParticles.Type),
                 "GroupMarker" => SimParticles.GroupMarker,
                 "GhostPoints" => gp,

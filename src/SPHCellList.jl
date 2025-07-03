@@ -122,7 +122,6 @@ using Bumper
                 @spawn for iter ∈ inds
 
                     CellIndex = UniqueCells[iter]
-                    SimParticles.ChunkID[iter] = ichunk
 
                     StartIndex = ParticleRanges[iter]
                     EndIndex   = ParticleRanges[iter+1] - 1
@@ -250,13 +249,7 @@ using Bumper
             SimThreadedArrays.AccelerationThreaded[ichunk][j] -= uₘ 
 
             
-            if FlagOutputKernelValues
-                Wᵢⱼ  = @fastpow @fastpow SPHKernels.Wᵢⱼ(SimKernel, q)
-                SimThreadedArrays.KernelThreaded[ichunk][i]         += Wᵢⱼ
-                SimThreadedArrays.KernelThreaded[ichunk][j]         += Wᵢⱼ
-                SimThreadedArrays.KernelGradientThreaded[ichunk][i] +=  ∇ᵢWᵢⱼ
-                SimThreadedArrays.KernelGradientThreaded[ichunk][j] += -∇ᵢWᵢⱼ
-            end
+            # Kernel output disabled in minimal build
 
             if SimMetaData.FlagShifting
                 Wᵢⱼ  = @fastpow SPHKernels.Wᵢⱼ(SimKernel, q)
@@ -340,13 +333,11 @@ using Bumper
         end
     end
 
-    function ResetStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ)
+    function ResetStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, ∇Cᵢ, ∇◌rᵢ)
         
         ResetArrays!(dρdtI, Acceleration)
 
-        if SimMetaData.FlagOutputKernelValues
-            ResetArrays!(Kernel, KernelGradient)
-        end
+        # Kernel arrays removed in minimal build
 
         if SimMetaData.FlagShifting
             ResetArrays!(∇Cᵢ, ∇◌rᵢ)
@@ -357,14 +348,11 @@ using Bumper
         return nothing
     end
 
-    function ReductionStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ)
+    function ReductionStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, ∇Cᵢ, ∇◌rᵢ)
         reduce_sum!(dρdtI, SimThreadedArrays.dρdtIThreaded)
         reduce_sum!(Acceleration, SimThreadedArrays.AccelerationThreaded)
   
-        if SimMetaData.FlagOutputKernelValues
-            reduce_sum!(Kernel, SimThreadedArrays.KernelThreaded)
-            reduce_sum!(KernelGradient, SimThreadedArrays.KernelGradientThreaded)
-        end
+        # Kernel arrays removed in minimal build
 
         if SimMetaData.FlagShifting
             reduce_sum!(∇Cᵢ, SimThreadedArrays.∇CᵢThreaded)
@@ -543,8 +531,6 @@ using Bumper
         MotionLimiter  = SimParticles.MotionLimiter
         ParticleType   = SimParticles.Type
         ParticleMarker = SimParticles.GroupMarker
-        Kernel         = SimParticles.Kernel
-        KernelGradient = SimParticles.KernelGradient
         GhostPoints    = SimParticles.GhostPoints
         GhostNormals   = SimParticles.GhostNormals
 
@@ -582,7 +568,7 @@ using Bumper
             
                 if !SimMetaData.FlagSingleStepTimeStepping
                     ###=== First step of resetting arrays
-                    @timeit SimMetaData.HourGlass "ResetArrays"                          ResetStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ)
+                    @timeit SimMetaData.HourGlass "ResetArrays"                          ResetStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, ∇Cᵢ, ∇◌rᵢ)
                     ###===
                 
                     @timeit SimMetaData.HourGlass "03 Pressure"                          Pressure!(SimParticles.Pressure,SimParticles.Density,SimConstants)
@@ -594,7 +580,7 @@ using Bumper
                     end
 
                     @timeit SimMetaData.HourGlass "04 First NeighborLoop"                NeighborLoop!(SimDensityDiffusion, SimViscosity, SimKernel, SimMetaData, SimConstants, SimParticles, SimThreadedArrays, ParticleRanges, CellDict, Stencil, Position, Density, Pressure, Velocity, MotionLimiter, UniqueCellsView, EnumeratedIndices)
-                    @timeit SimMetaData.HourGlass "Reduction"                            ReductionStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ)
+                    @timeit SimMetaData.HourGlass "Reduction"                            ReductionStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, ∇Cᵢ, ∇◌rᵢ)
                 end
 
 
@@ -604,14 +590,14 @@ using Bumper
                 @timeit SimMetaData.HourGlass "06 Half LimitDensityAtBoundary"           LimitDensityAtBoundary!(ρₙ⁺, SimConstants.ρ₀, MotionLimiter)
             
                 ###=== Second step of resetting arrays
-                @timeit SimMetaData.HourGlass "ResetArrays"                              ResetStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ)
+                @timeit SimMetaData.HourGlass "ResetArrays"                              ResetStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, ∇Cᵢ, ∇◌rᵢ)
                 ###===
 
                 @timeit SimMetaData.HourGlass "Motion"                                   ProgressMotion(Position, Velocity, ParticleType, ParticleMarker, dt₂, MotionDefinition, SimMetaData)
             
                 @timeit SimMetaData.HourGlass "03 Pressure"                              Pressure!(SimParticles.Pressure, ρₙ⁺,SimConstants)
                 @timeit SimMetaData.HourGlass "08 Second NeighborLoop"                   NeighborLoop!(SimDensityDiffusion, SimViscosity, SimKernel, SimMetaData, SimConstants, SimParticles, SimThreadedArrays, ParticleRanges, CellDict, Stencil, Positionₙ⁺, ρₙ⁺, Pressure, Velocityₙ⁺, MotionLimiter, UniqueCellsView, EnumeratedIndices)
-                @timeit SimMetaData.HourGlass "Reduction"                                ReductionStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ)
+                @timeit SimMetaData.HourGlass "Reduction"                                ReductionStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, ∇Cᵢ, ∇◌rᵢ)
 
             
                 @timeit SimMetaData.HourGlass "09 Final LimitDensityAtBoundary"          LimitDensityAtBoundary!(Density, SimConstants.ρ₀, MotionLimiter)

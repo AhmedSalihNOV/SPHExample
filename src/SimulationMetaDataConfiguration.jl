@@ -25,15 +25,10 @@ export SimulationMetaData
     ExportSingleVTKHDF::Bool                = true
     ExportGridCells::Bool                   = false
     OutputVariables::Vector{String}         = [
-        "ChunkID",
-        "Kernel",
-        "KernelGradient",
         "Density",
         "Pressure",
         "Velocity",
         "Acceleration",
-        "BoundaryBool",
-        "ID",
         "Type",
         "GroupMarker",
         "GhostPoints",

@@ -725,7 +725,7 @@ using Bumper
                 showvalues = generate_showvalues(
                     SimMetaData.Iteration,
                     SimMetaData.TotalTime,
-                    1e6,
+                    NaN,
                 ),
             )
         end

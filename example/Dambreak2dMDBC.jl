@@ -76,6 +76,10 @@ let
     SimKernel = SPHKernelInstance{Dimensions, FloatType}(WendlandC2();
         dx = SimConstantsDambreak.dx)
 
+    line = MeasurementLine(SVector(0.5, 0.0), SVector(0.5, 0.5), 20)
+    sim_measurements =
+        SimMeasurements([SimMeasurement(line, :Pressure)], [0.0, 1.0])
+
     RunSimulation(
         SimGeometry          = SimulationGeometry,
         SimMetaData          = SimMetaDataDambreak,
@@ -85,15 +89,10 @@ let
         SimParticles         = SimParticles,
         SimViscosity         = ArtificialViscosity(),
         SimDensityDiffusion  = LinearDensityDiffusion(),
-        ParticleNormalsPath  = "./input/dam_break_2d/DamBreak2d_Dp0.02_MDBC_GhostNodes_ThreeLayers.csv"
+        ParticleNormalsPath  =
+            "./input/dam_break_2d/DamBreak2d_Dp0.02_MDBC_GhostNodes_ThreeLayers.csv",
+        SimMeasurements      = sim_measurements,
     )
 
-    line = MeasurementLine(SVector(0.5, 0.0), SVector(0.5, 0.5), 20)
-    sim_measurements = SimMeasurements([SimMeasurement(line, :Pressure)], [0.0])
-    perform_measurements!(sim_measurements, 0.0, SimParticles, SimConstantsDambreak,
-                          SimKernel)
-    save_measurement_vtk(sim_measurements.measurements[1], 0.0,
-                         joinpath(SimMetaDataDambreak.SaveLocation,
-                                  "line_measurement.vtkhdf"))
     @show sim_measurements.measurements[1].data[0.0]
 end

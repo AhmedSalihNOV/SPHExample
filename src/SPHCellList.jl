@@ -643,7 +643,8 @@ using Bumper
         SimParticles::StructArray,
         SimViscosity::SV,
         SimDensityDiffusion::SDD,
-        ParticleNormalsPath::Union{Nothing,String} = nothing
+        ParticleNormalsPath::Union{Nothing,String} = nothing,
+        sim_measurements = nothing,
         ) where {Dimensions,FloatType,SV<:SPHViscosity,SDD<:SPHDensityDiffusion}
 
         # Unpack the relevant simulation meta data
@@ -697,10 +698,29 @@ using Bumper
 
         output = SetupVTKOutput(SimMetaData, SimParticles, SimKernel, Dimensions)
 
+        maybe_record_measurements = sim_measurements === nothing ?
+            (time, iter) -> nothing :
+            (time, iter) -> begin
+                parent = parentmodule(@__MODULE__)
+                Base.invokelatest(getfield(parent, :perform_measurements!),
+                                  sim_measurements, time, SimParticles,
+                                  SimConstants, SimKernel)
+                any(t -> isapprox(time, t; atol = 1e-12),
+                    sim_measurements.times) || return
+                for (mi, m) in enumerate(sim_measurements.measurements)
+                    filepath = joinpath(SimMetaData.SaveLocation,
+                                        "measurement_$(mi)_$(iter).vtkhdf")
+                    Base.invokelatest(getfield(parent, :save_measurement_vtk),
+                                       m, time, filepath)
+                end
+            end
+
         # Save initial state, use 1 else this cannot be used to index fid vector
         SimMetaData.OutputIterationCounter = 1
         output.save_particles(SimMetaData.OutputIterationCounter)
         output.save_grid(SimMetaData.OutputIterationCounter, UniqueCells, SimParticles)
+        maybe_record_measurements(SimMetaData.TotalTime,
+                                  SimMetaData.OutputIterationCounter)
 
 
         # Assuming group markers are sequential
@@ -747,7 +767,10 @@ using Bumper
                 @timeit SimMetaData.HourGlass "13A Save Particle Data" output.save_particles(SimMetaData.OutputIterationCounter)
                 @timeit SimMetaData.HourGlass "13A Save CellGrid Data" output.save_grid(SimMetaData.OutputIterationCounter, UniqueCellsView, SimParticles)
             end
-    
+
+            maybe_record_measurements(SimMetaData.TotalTime,
+                                      SimMetaData.OutputIterationCounter)
+
             if !SimLogger.ToConsole
                 TimeLeftInSeconds = (SimMetaData.SimulationTime - SimMetaData.TotalTime) *
                                     (TimerOutputs.tottime(HourGlass) / 1e9 / SimMetaData.TotalTime)

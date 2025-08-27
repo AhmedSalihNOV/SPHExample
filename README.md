@@ -81,6 +81,10 @@ Pkg.add(url="https://github.com/AhmedSalih3d/SPHExample")
 
 Open one of the files in `example/`, for instance `example/StillWedgeMDBC.jl`, and adjust the simulation parameters or the `ComputerInteractions!` function. Run the script to start the simulation. Results are written in `hdfvtk` format which can be loaded with ParaView 5.12 or newer.
 
+Transient field measurements may be collected by passing a `SimMeasurements`
+object to `RunSimulation`. When measurement times are reached, results are
+interpolated and saved in VTKHDF files.
+
 ## Help
 
 Questions or issues can be posted on the GitHub issue tracker. Response times may vary but all feedback is welcome.
@@ -93,6 +97,7 @@ Written by Ahmed Salih ([AhmedSalih3d](https://github.com/AhmedSalih3d)).
 
 | Version | Description |
 |---------|-------------|
+| 0.6.13 | Transient field measurements through `RunSimulation` |
 | 0.6.12 | Field measurement utilities with optional VTK export |
 | 0.6.11 | Added `ChunkMultiplier` for improved thread load balance |
 | 0.6.10 | Implemented concepts of tests, aim is to understand allocations and run time |

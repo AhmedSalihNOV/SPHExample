@@ -1,4 +1,4 @@
-module Measurement
+module SPHMeasurements
 
 using StaticArrays
 using LinearAlgebra

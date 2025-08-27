@@ -16,7 +16,7 @@ module SPHExample
         "OpenExternalPrograms.jl",
         "SPHDensityDiffusionModels.jl",
         "SPHCellList.jl",
-        "Measurement.jl",
+        "SPHMeasurements.jl",
     ]
     foreach(include, submodules)
 
@@ -63,7 +63,7 @@ module SPHExample
     using .OpenExternalPrograms
     export AutoOpenLogFile, AutoOpenParaview
 
-    using .Measurement
+    using .SPHMeasurements
     export MeasurementPoint, MeasurementLine, MeasurementGrid,
            measurement_points, interpolate_field,
            SimMeasurement, SimMeasurements, perform_measurements!,

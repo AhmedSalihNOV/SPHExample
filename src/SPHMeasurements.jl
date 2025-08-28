@@ -54,21 +54,36 @@ Return the discretized measurement points for `region`.
 """
 measurement_points(region::MeasurementPoint) = [region.point]
 
-function measurement_points(region::MeasurementLine)
-    pts = Vector{typeof(region.line_start)}(undef, region.num_points)
-    for i in 1:region.num_points
-        t = region.num_points == 1 ? zero(eltype(region.line_start)) :
-            (i - 1) / (region.num_points - 1)
-        pts[i] = (one(t) - t) * region.line_start + t * region.line_end
+function measurement_points(region::MeasurementLine{D,T}) where {D,T}
+    pts = Vector{SVector{D,T}}(undef, region.num_points)
+    
+    if region.num_points == 1
+        pts[1] = region.line_start
+        return pts
     end
+    
+    for i in 1:region.num_points
+        t = (i - 1) / (region.num_points - 1)
+        pts[i] = region.line_start + t * (region.line_end - region.line_start)
+    end
+
     return pts
 end
 
+using StaticArrays
+
 function measurement_points(region::MeasurementGrid{D,T}) where {D,T}
-    pts = Vector{SVector{D,T}}()
-    for I in CartesianIndices(region.dims)
-        offset = SVector{D,T}(Tuple(I) .- 1)
-        push!(pts, region.origin .+ region.spacing .* offset)
+    dims    = region.dims
+    origin  = region.origin        # SVector{D,T}
+    spacing = region.spacing       # SVector{D,T}
+
+    n   = prod(dims)
+    pts = Vector{SVector{D,T}}(undef, n)
+
+    @inbounds for (i, I) in enumerate(CartesianIndices(dims))
+        # Build offset without Tuple(I) and convert to T once
+        offset = SVector{D,T}(ntuple(j -> T(I[j] - 1), Val(D)))
+        pts[i] = origin + spacing .* offset
     end
     return pts
 end
@@ -84,13 +99,18 @@ function interpolate_field(points, field, particles, constants, kernel::SPHKerne
     m₀ = constants.m₀
     ρ = particles.Density
     x = particles.Position
-    result = zeros(eltype(field), length(points))
+    
+    # Pre-allocate with correct type
+    T = promote_type(eltype(field), typeof(m₀))
+    result = Vector{T}(undef, length(points))
+    
     for (pi, p) in enumerate(points)
-        s = zero(eltype(field))
+        s = zero(T)
         for i in eachindex(x)
             dx = p - x[i]
             r2 = dot(dx, dx)
             r2 > kernel.H² && continue
+            
             q = sqrt(r2) * kernel.h⁻¹
             w = Wᵢⱼ(kernel, q)
             s += field[i] * w * m₀ / ρ[i]
@@ -107,8 +127,8 @@ Interpolate `field` at the discretized points of `region`.
 """
 function interpolate_field(region::MeasurementRegion, field, particles, constants,
                            kernel::SPHKernelInstance)
-    pts = measurement_points(region)
-    return interpolate_field(pts, field, particles, constants, kernel)
+    points = measurement_points(region)
+    return interpolate_field(points, field, particles, constants, kernel)
 end
 
 """

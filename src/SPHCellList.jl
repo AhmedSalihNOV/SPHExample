@@ -59,7 +59,7 @@ using Bumper
     @inline function extract_cells!(cells, position::Vector{SVector{D, T}}, inverse_cutoff) where {D, T}
         @inbounds @simd ivdep for i ∈ eachindex(cells)
             pos = position[i]
-            cells[i] = CartesianIndex(ntuple(j -> map_floor(@inbounds pos[j], inverse_cutoff),
+            cells[i] = CartesianIndex(ntuple(j -> map_floor(@inbounds(pos[j]), inverse_cutoff),
                                              Val(D)))
         end
 

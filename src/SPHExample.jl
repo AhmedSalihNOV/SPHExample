@@ -62,5 +62,7 @@ module SPHExample
     using .OpenExternalPrograms
     export AutoOpenLogFile, AutoOpenParaview
 
+    include("precompile.jl")
+
 end
 

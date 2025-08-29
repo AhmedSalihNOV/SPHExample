@@ -23,6 +23,7 @@ The project demonstrates how to assemble a small SPH solver with Julia. It focus
 - **Dynamic boundary condition** – inspired by DualSPHysics.
 - **Density diffusion** – based on Fourtakas et al. 2019 to reduce pressure noise.
 - **Wendland quintic kernel** – simple and stable without tensile corrections.
+- **Measurement utilities** – interpolate fields at arbitrary points, lines or grids.
 
 ## Folder Structure
 
@@ -92,6 +93,7 @@ Written by Ahmed Salih ([AhmedSalih3d](https://github.com/AhmedSalih3d)).
 
 | Version | Description |
 |---------|-------------|
+| 0.6.12 | Field measurement utilities with optional VTK export |
 | 0.6.11 | Added `ChunkMultiplier` for improved thread load balance |
 | 0.6.10 | Implemented concepts of tests, aim is to understand allocations and run time |
 | 0.6.9  | Specify output times via `OutputTimes` (float or vector). |

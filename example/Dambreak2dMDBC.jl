@@ -1,4 +1,5 @@
 using SPHExample
+using StaticArrays
 
 let
     Dimensions = 2
@@ -72,15 +73,27 @@ let
 
     CleanUpSimulationFolder(SimMetaDataDambreak.SaveLocation)
 
-    @profview RunSimulation(
+    SimKernel = SPHKernelInstance{Dimensions, FloatType}(WendlandC2();
+        dx = SimConstantsDambreak.dx)
+
+    RunSimulation(
         SimGeometry          = SimulationGeometry,
         SimMetaData          = SimMetaDataDambreak,
         SimConstants         = SimConstantsDambreak,
-        SimKernel            = SPHKernelInstance{Dimensions, FloatType}(WendlandC2(); dx = SimConstantsDambreak.dx),
+        SimKernel            = SimKernel,
         SimLogger            = SimLogger,
         SimParticles         = SimParticles,
         SimViscosity         = ArtificialViscosity(),
         SimDensityDiffusion  = LinearDensityDiffusion(),
         ParticleNormalsPath  = "./input/dam_break_2d/DamBreak2d_Dp0.02_MDBC_GhostNodes_ThreeLayers.csv"
     )
+
+    line = MeasurementLine(SVector(0.5, 0.0), SVector(0.5, 0.5), 20)
+    sim_measurements = SimMeasurements([SimMeasurement(line, :Pressure)], [0.0])
+    perform_measurements!(sim_measurements, 0.0, SimParticles, SimConstantsDambreak,
+                          SimKernel)
+    save_measurement_vtk(sim_measurements.measurements[1], 0.0,
+                         joinpath(SimMetaDataDambreak.SaveLocation,
+                                  "line_measurement.vtkhdf"))
+    @show sim_measurements.measurements[1].data[0.0]
 end

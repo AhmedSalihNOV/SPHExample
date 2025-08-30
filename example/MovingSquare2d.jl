@@ -15,7 +15,7 @@ let
         CFL=0.2
     )
 
-    SimMetaDataMovingSquare  = SimulationMetaData{Dimensions,FloatType}(
+    SimMetaDataMovingSquare  = SimulationMetaData{Dimensions,FloatType,ShiftingEnabled}(
         SimulationName="MovingSquare2D", 
         SaveLocation="C:/TestSimulations/MovingSquare2D",
         SimulationTime=2.5,
@@ -25,7 +25,7 @@ let
         OpenLogFile=true,
         FlagOutputKernelValues=false,
         FlagLog=true,
-        FlagShifting=true
+        shifting_mode=ShiftingEnabled()
     )
     FixedBoundary = Geometry{Dimensions, FloatType}(
         CSVFile     = "./input/moving_square_2d/MovingSquare_Dp$(SimConstantsMovingSquare.dx)_Fixed.csv",

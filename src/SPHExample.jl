@@ -52,7 +52,7 @@ module SPHExample
     export SimulationLogger, generate_format_string, InitializeLogger, LogSimulationDetails, LogStep, LogFinal
 
     using .SimulationMetaDataConfiguration
-    export SimulationMetaData
+    export SimulationMetaData, ShiftingEnabled, ShiftingDisabled
 
     using .SimulationConstantsConfiguration
     export SimulationConstants

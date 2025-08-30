@@ -7,6 +7,7 @@ using StaticArrays
 using StructArrays
 
 using ..SimulationGeometry
+using ..SimulationMetaDataConfiguration: SimulationMetaData, ShiftingEnabled, ShiftingDisabled
 
 function LoadSpecificCSV(::Val{D}, ::Type{T}, particle_type::ParticleType,
                          particle_group_marker::Int,
@@ -137,9 +138,9 @@ function AllocateSupportDataStructures(Position)
     return dρdtI, Velocityₙ⁺, Positionₙ⁺, ρₙ⁺, ∇Cᵢ, ∇◌rᵢ
 end
 
-function AllocateThreadedArrays(SimMetaData, SimParticles, dρdtI, ∇Cᵢ, ∇◌rᵢ   ; n_copy = Base.Threads.nthreads())
-    
-        
+function AllocateThreadedArrays(SimMetaData::SimulationMetaData{D,F,ShiftingDisabled},
+                                SimParticles, dρdtI, ∇Cᵢ, ∇◌rᵢ;
+                                n_copy = Base.Threads.nthreads()) where {D,F}
     dρdtIThreaded        = [copy(dρdtI) for _ in 1:n_copy]
     AccelerationThreaded = [copy(SimParticles.KernelGradient) for _ in 1:n_copy]
 
@@ -157,18 +158,37 @@ function AllocateThreadedArrays(SimMetaData, SimParticles, dρdtI, ∇Cᵢ, ∇�
         ))
     end
 
-    if SimMetaData.FlagShifting
-        ∇CᵢThreaded  = [copy(∇Cᵢ) for _ in 1:n_copy]
-        ∇◌rᵢThreaded = [copy(∇◌rᵢ) for _ in 1:n_copy]
+    return StructArray(nt)
+end
+
+function AllocateThreadedArrays(SimMetaData::SimulationMetaData{D,F,ShiftingEnabled},
+                                SimParticles, dρdtI, ∇Cᵢ, ∇◌rᵢ;
+                                n_copy = Base.Threads.nthreads()) where {D,F}
+    dρdtIThreaded        = [copy(dρdtI) for _ in 1:n_copy]
+    AccelerationThreaded = [copy(SimParticles.KernelGradient) for _ in 1:n_copy]
+
+    nt = (
+        dρdtIThreaded = dρdtIThreaded,
+        AccelerationThreaded = AccelerationThreaded,
+    )
+
+    if SimMetaData.FlagOutputKernelValues
+        KernelThreaded         = [copy(SimParticles.Kernel) for _ in 1:n_copy]
+        KernelGradientThreaded = [copy(SimParticles.KernelGradient) for _ in 1:n_copy]
         nt = merge(nt, (
-            ∇CᵢThreaded  = ∇CᵢThreaded,
-            ∇◌rᵢThreaded = ∇◌rᵢThreaded,
+            KernelThreaded = KernelThreaded,
+            KernelGradientThreaded = KernelGradientThreaded,
         ))
     end
 
-    SimThreadedArrays = StructArray(nt)
+    ∇CᵢThreaded  = [copy(∇Cᵢ) for _ in 1:n_copy]
+    ∇◌rᵢThreaded = [copy(∇◌rᵢ) for _ in 1:n_copy]
+    nt = merge(nt, (
+        ∇CᵢThreaded  = ∇CᵢThreaded,
+        ∇◌rᵢThreaded = ∇◌rᵢThreaded,
+    ))
 
-    return SimThreadedArrays
+    return StructArray(nt)
 end
 
 function LoadBoundaryNormals(::Val{D}, ::Type{T}, path_mdbc) where {D, T}

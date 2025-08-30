@@ -20,7 +20,7 @@ end
     T = Float64
     sc = SimulationConstants{T}()
     ker = SPHKernelInstance{D,T}(WendlandC2(); dx=sc.dx)
-    meta = SimulationMetaData{D,T}(SimulationName="iso", SaveLocation=".")
+    meta = SimulationMetaData{D,T,ShiftingDisabled}(SimulationName="iso", SaveLocation=".")
 
     pos = [SVector{D,T}(0, 0)]
     vel = [SVector{D,T}(0, 0)]

@@ -137,38 +137,40 @@ function AllocateSupportDataStructures(Position)
     return dρdtI, Velocityₙ⁺, Positionₙ⁺, ρₙ⁺, ∇Cᵢ, ∇◌rᵢ
 end
 
-function AllocateThreadedArrays(SimMetaData, SimParticles, dρdtI, ∇Cᵢ, ∇◌rᵢ   ; n_copy = Base.Threads.nthreads())
-    
-        
-    dρdtIThreaded        = [copy(dρdtI) for _ in 1:n_copy]
-    AccelerationThreaded = [copy(SimParticles.KernelGradient) for _ in 1:n_copy]
+function AllocateThreadedArrays(SimMetaData, SimParticles, dρdtI, ∇Cᵢ, ∇◌rᵢ)
+
+    n = length(dρdtI)
+    locks = [ReentrantLock() for _ in 1:n]
+    step = Ref{Int}(0)
 
     nt = (
-        dρdtIThreaded = dρdtIThreaded,
-        AccelerationThreaded = AccelerationThreaded,
+        locks = locks,
+        step = step,
+        dρdtI = dρdtI,
+        Acceleration = SimParticles.Acceleration,
+        dρdtI_touched = zeros(Int, n),
+        Acceleration_touched = zeros(Int, n),
     )
 
     if SimMetaData.FlagOutputKernelValues
-        KernelThreaded         = [copy(SimParticles.Kernel) for _ in 1:n_copy]
-        KernelGradientThreaded = [copy(SimParticles.KernelGradient) for _ in 1:n_copy]
         nt = merge(nt, (
-            KernelThreaded = KernelThreaded,
-            KernelGradientThreaded = KernelGradientThreaded,
+            Kernel = SimParticles.Kernel,
+            KernelGradient = SimParticles.KernelGradient,
+            Kernel_touched = zeros(Int, n),
+            KernelGradient_touched = zeros(Int, n),
         ))
     end
 
     if SimMetaData.FlagShifting
-        ∇CᵢThreaded  = [copy(∇Cᵢ) for _ in 1:n_copy]
-        ∇◌rᵢThreaded = [copy(∇◌rᵢ) for _ in 1:n_copy]
         nt = merge(nt, (
-            ∇CᵢThreaded  = ∇CᵢThreaded,
-            ∇◌rᵢThreaded = ∇◌rᵢThreaded,
+            ∇Cᵢ = ∇Cᵢ,
+            ∇◌rᵢ = ∇◌rᵢ,
+            ∇Cᵢ_touched = zeros(Int, n),
+            ∇◌rᵢ_touched = zeros(Int, n),
         ))
     end
 
-    SimThreadedArrays = StructArray(nt)
-
-    return SimThreadedArrays
+    return nt
 end
 
 function LoadBoundaryNormals(::Val{D}, ::Type{T}, path_mdbc) where {D, T}

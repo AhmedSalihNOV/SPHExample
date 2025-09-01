@@ -18,7 +18,7 @@ using ..SPHKernels
 using ..SPHViscosityModels
 using ..SPHDensityDiffusionModels
 
-import StructArrays: StructArray, foreachfield
+import StructArrays: StructArray
 import LinearAlgebra: dot, norm, diagm, diag, cond, det
 import FastPow: @fastpow
 import ProgressMeter: next!, finish!
@@ -135,7 +135,7 @@ using Bumper
                             ComputeInteractions!(SimDensityDiffusion, SimViscosity, SimKernel, SimMetaData,
                                                 SimConstants, SimParticles, SimThreadedArrays,
                                                 Position, Density, Pressure, Velocity,
-                                                i, j, MotionLimiter, Threads.threadid())
+                                                i, j, MotionLimiter)
                         end
 
                         # (2) Interactions between this cell and each neighboring cell in the stencil
@@ -148,7 +148,7 @@ using Bumper
                                 ComputeInteractions!(SimDensityDiffusion, SimViscosity, SimKernel, SimMetaData,
                                                     SimConstants, SimParticles, SimThreadedArrays,
                                                     Position, Density, Pressure, Velocity,
-                                                    i, j, MotionLimiter, Threads.threadid())
+                                                    i, j, MotionLimiter)
                             end
                         end
                     end
@@ -208,25 +208,23 @@ using Bumper
         return nothing
     end
 
-    Base.@propagate_inbounds function ComputeInteractions!(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel, SimMetaData, SimConstants, SimParticles, SimThreadedArrays, Position, Density, Pressure, Velocity, i, j, MotionLimiter, ichunk) where {SDD<:SPHDensityDiffusion, SV<:SPHViscosity}
+    Base.@propagate_inbounds function ComputeInteractions!(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel, SimMetaData, SimConstants, SimParticles, SimThreadedArrays, Position, Density, Pressure, Velocity, i, j, MotionLimiter) where {SDD<:SPHDensityDiffusion, SV<:SPHViscosity}
         (; FlagOutputKernelValues) = SimMetaData
         (; ρ₀, m₀, α, γ, g, c₀, δᵩ, Cb, Cb⁻¹, ν₀, dx, SmagorinskyConstant, BlinConstant) = SimConstants
 
         (; h⁻¹, h, η², H², αD) = SimKernel
 
         xᵢⱼ  = Position[i] - Position[j]
-        xᵢⱼ² = dot(xᵢⱼ,xᵢⱼ)              
+        xᵢⱼ² = dot(xᵢⱼ,xᵢⱼ)
         if  xᵢⱼ² <= H²
-            #https://discourse.julialang.org/t/sqrt-abs-x-is-even-faster-than-sqrt/58154/2
             dᵢⱼ  = sqrt(abs(xᵢⱼ²))
 
-            # clamp seems faster than min, no util
-            q         = clamp(dᵢⱼ * h⁻¹, 0.0, 2.0) #min(dᵢⱼ * h⁻¹, 2.0) - 8% util no DDT
+            q         = clamp(dᵢⱼ * h⁻¹, 0.0, 2.0)
             ∇ᵢWᵢⱼ     = @fastpow ∇Wᵢⱼ(SimKernel, q, xᵢⱼ)
-            
+
             ρᵢ        = Density[i]
             ρⱼ        = Density[j]
-        
+
             vᵢ        = Velocity[i]
             vⱼ        = Velocity[j]
             vᵢⱼ       = vᵢ - vⱼ
@@ -236,9 +234,9 @@ using Bumper
 
             Dᵢ, Dⱼ = compute_density_diffusion(SimDensityDiffusion, SimKernel, SimConstants, SimParticles, xᵢⱼ, ∇ᵢWᵢⱼ, xᵢⱼ², i, j, MotionLimiter)
 
-            SimThreadedArrays.dρdtIThreaded[ichunk][i] += dρdt⁺ + Dᵢ
-            SimThreadedArrays.dρdtIThreaded[ichunk][j] += dρdt⁻ + Dⱼ
-
+            step = SimThreadedArrays.step[]
+            atomiconce_add!(SimThreadedArrays.dρdtI, SimThreadedArrays.dρdtI_touched, SimThreadedArrays.locks, i, dρdt⁺ + Dᵢ, step)
+            atomiconce_add!(SimThreadedArrays.dρdtI, SimThreadedArrays.dρdtI_touched, SimThreadedArrays.locks, j, dρdt⁻ + Dⱼ, step)
 
             Pᵢ      =  Pressure[i]
             Pⱼ      =  Pressure[j]
@@ -249,29 +247,26 @@ using Bumper
             visc_term, _ = compute_viscosity(SimViscosity, SimKernel, SimConstants, SimParticles, xᵢⱼ, vᵢⱼ, ∇ᵢWᵢⱼ, xᵢⱼ², i, j)
 
             uₘ = dvdt⁺ + visc_term
-            SimThreadedArrays.AccelerationThreaded[ichunk][i] += uₘ
-            SimThreadedArrays.AccelerationThreaded[ichunk][j] -= uₘ 
+            atomiconce_add!(SimThreadedArrays.Acceleration, SimThreadedArrays.Acceleration_touched, SimThreadedArrays.locks, i, uₘ, step)
+            atomiconce_add!(SimThreadedArrays.Acceleration, SimThreadedArrays.Acceleration_touched, SimThreadedArrays.locks, j, -uₘ, step)
 
-            
             if FlagOutputKernelValues
                 Wᵢⱼ  = @fastpow SPHKernels.Wᵢⱼ(SimKernel, q)
-                SimThreadedArrays.KernelThreaded[ichunk][i]         += Wᵢⱼ
-                SimThreadedArrays.KernelThreaded[ichunk][j]         += Wᵢⱼ
-                SimThreadedArrays.KernelGradientThreaded[ichunk][i] +=  ∇ᵢWᵢⱼ
-                SimThreadedArrays.KernelGradientThreaded[ichunk][j] += -∇ᵢWᵢⱼ
+                atomiconce_add!(SimThreadedArrays.Kernel, SimThreadedArrays.Kernel_touched, SimThreadedArrays.locks, i, Wᵢⱼ, step)
+                atomiconce_add!(SimThreadedArrays.Kernel, SimThreadedArrays.Kernel_touched, SimThreadedArrays.locks, j, Wᵢⱼ, step)
+                atomiconce_add!(SimThreadedArrays.KernelGradient, SimThreadedArrays.KernelGradient_touched, SimThreadedArrays.locks, i, ∇ᵢWᵢⱼ, step)
+                atomiconce_add!(SimThreadedArrays.KernelGradient, SimThreadedArrays.KernelGradient_touched, SimThreadedArrays.locks, j, -∇ᵢWᵢⱼ, step)
             end
 
             if SimMetaData.FlagShifting
-                
+
                 MLcond = MotionLimiter[i] * MotionLimiter[j]
 
-                SimThreadedArrays.∇CᵢThreaded[ichunk][i]   += (m₀/ρᵢ) *  ∇ᵢWᵢⱼ
-                SimThreadedArrays.∇CᵢThreaded[ichunk][j]   += (m₀/ρⱼ) * -∇ᵢWᵢⱼ
-        
-                # Switch signs compared to DSPH, else free surface detection does not make sense
-                # Agrees, https://arxiv.org/abs/2110.10076, it should have been r_ji
-                SimThreadedArrays.∇◌rᵢThreaded[ichunk][i]  += (m₀/ρⱼ) * dot(-xᵢⱼ , ∇ᵢWᵢⱼ)  * MLcond
-                SimThreadedArrays.∇◌rᵢThreaded[ichunk][j]  += (m₀/ρᵢ) * dot( xᵢⱼ ,-∇ᵢWᵢⱼ)  * MLcond
+                atomiconce_add!(SimThreadedArrays.∇Cᵢ, SimThreadedArrays.∇Cᵢ_touched, SimThreadedArrays.locks, i, (m₀/ρᵢ) *  ∇ᵢWᵢⱼ, step)
+                atomiconce_add!(SimThreadedArrays.∇Cᵢ, SimThreadedArrays.∇Cᵢ_touched, SimThreadedArrays.locks, j, (m₀/ρⱼ) * -∇ᵢWᵢⱼ, step)
+
+                atomiconce_add!(SimThreadedArrays.∇◌rᵢ, SimThreadedArrays.∇◌rᵢ_touched, SimThreadedArrays.locks, i, (m₀/ρⱼ) * dot(-xᵢⱼ , ∇ᵢWᵢⱼ)  * MLcond, step)
+                atomiconce_add!(SimThreadedArrays.∇◌rᵢ, SimThreadedArrays.∇◌rᵢ_touched, SimThreadedArrays.locks, j, (m₀/ρᵢ) * dot( xᵢⱼ ,-∇ᵢWᵢⱼ)  * MLcond, step)
             end
         end
 
@@ -326,64 +321,21 @@ using Bumper
         return bΔ, AΔ
     end
 
-    function reduce_sum!(target_array, arrays)
-        n = length(target_array)
-        num_threads = nthreads()
-        chunk_size = ceil(Int, n / num_threads)
-        @inbounds @threads for t in 1:num_threads
-            local start_idx = 1 + (t-1) * chunk_size
-            local end_idx = min(t * chunk_size, n)
-            for j in eachindex(arrays)
-                local array = arrays[j]  # Access array only once per thread
-                @simd ivdep for i in start_idx:end_idx
-                    @inbounds target_array[i] += array[i]
-                end
-            end
+    @inline function atomiconce_add!(arr, touched, locks, idx, val, step)
+        l = locks[idx]
+        lock(l)
+        if touched[idx] != step
+            arr[idx] = val
+            touched[idx] = step
+        else
+            arr[idx] += val
         end
-    end
-
-    function ResetStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ)
-        # Threaded zeroing for main arrays
-        @threads for arr in (dρdtI, Acceleration)
-            fill!(arr, zero(eltype(arr)))
-        end
-
-        if SimMetaData.FlagOutputKernelValues
-            @threads for arr in (Kernel, KernelGradient)
-                fill!(arr, zero(eltype(arr)))
-            end
-        end
-
-        if SimMetaData.FlagShifting
-            @threads for arr in (∇Cᵢ, ∇◌rᵢ)
-                fill!(arr, zero(eltype(arr)))
-            end
-        end
-
-        # Threaded zeroing for fields in SimThreadedArrays
-        foreachfield(f -> begin
-            Threads.@threads for v in f
-                fill!(v, zero(eltype(v)))
-            end
-        end, SimThreadedArrays)
-
+        unlock(l)
         return nothing
     end
 
-    function ReductionStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ)
-        reduce_sum!(dρdtI, SimThreadedArrays.dρdtIThreaded)
-        reduce_sum!(Acceleration, SimThreadedArrays.AccelerationThreaded)
-  
-        if SimMetaData.FlagOutputKernelValues
-            reduce_sum!(Kernel, SimThreadedArrays.KernelThreaded)
-            reduce_sum!(KernelGradient, SimThreadedArrays.KernelGradientThreaded)
-        end
-
-        if SimMetaData.FlagShifting
-            reduce_sum!(∇Cᵢ, SimThreadedArrays.∇CᵢThreaded)
-            reduce_sum!(∇◌rᵢ, SimThreadedArrays.∇◌rᵢThreaded)
-        end
-    
+    function ResetStep!(SimThreadedArrays)
+        SimThreadedArrays.step[] += 1
         return nothing
     end
     
@@ -583,7 +535,7 @@ using Bumper
             
                 if !SimMetaData.FlagSingleStepTimeStepping
                     ###=== First step of resetting arrays
-                    @timeit SimMetaData.HourGlass "ResetArrays"                          ResetStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ)
+                    @timeit SimMetaData.HourGlass "ResetArrays"                          ResetStep!(SimThreadedArrays)
                     ###===
                 
                     @timeit SimMetaData.HourGlass "03 Pressure"                          Pressure!(SimParticles.Pressure,SimParticles.Density,SimConstants)
@@ -595,7 +547,6 @@ using Bumper
                     end
 
                     @timeit SimMetaData.HourGlass "04 First NeighborLoop"                NeighborLoop!(SimDensityDiffusion, SimViscosity, SimKernel, SimMetaData, SimConstants, SimParticles, SimThreadedArrays, ParticleRanges, CellDict, Stencil, Position, Density, Pressure, Velocity, MotionLimiter, UniqueCellsView)
-                    @timeit SimMetaData.HourGlass "Reduction"                            ReductionStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ)
                 end
 
 
@@ -605,14 +556,13 @@ using Bumper
                 @timeit SimMetaData.HourGlass "06 Half LimitDensityAtBoundary"           LimitDensityAtBoundary!(ρₙ⁺, SimConstants.ρ₀, MotionLimiter)
             
                 ###=== Second step of resetting arrays
-                @timeit SimMetaData.HourGlass "ResetArrays"                              ResetStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ)
+                @timeit SimMetaData.HourGlass "ResetArrays"                              ResetStep!(SimThreadedArrays)
                 ###===
 
                 @timeit SimMetaData.HourGlass "Motion"                                   ProgressMotion(Position, Velocity, ParticleType, ParticleMarker, dt₂, MotionDefinition, SimMetaData)
             
                 @timeit SimMetaData.HourGlass "03 Pressure"                              Pressure!(SimParticles.Pressure, ρₙ⁺,SimConstants)
                 @timeit SimMetaData.HourGlass "08 Second NeighborLoop"                   NeighborLoop!(SimDensityDiffusion, SimViscosity, SimKernel, SimMetaData, SimConstants, SimParticles, SimThreadedArrays, ParticleRanges, CellDict, Stencil, Positionₙ⁺, ρₙ⁺, Pressure, Velocityₙ⁺, MotionLimiter, UniqueCellsView)
-                @timeit SimMetaData.HourGlass "Reduction"                                ReductionStep!(SimMetaData, SimThreadedArrays, dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ)
 
             
                 @timeit SimMetaData.HourGlass "09 Final LimitDensityAtBoundary"          LimitDensityAtBoundary!(Density, SimConstants.ρ₀, MotionLimiter)

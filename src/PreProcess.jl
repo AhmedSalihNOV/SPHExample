@@ -1,6 +1,6 @@
 module PreProcess
 
-export LoadBoundaryNormals, AllocateDataStructures, AllocateSupportDataStructures, AllocateThreadedArrays
+export LoadBoundaryNormals, AllocateDataStructures, AllocateSupportDataStructures, AllocateAtomicState
 
 using CSV
 using StaticArrays
@@ -137,25 +137,20 @@ function AllocateSupportDataStructures(Position)
     return dρdtI, Velocityₙ⁺, Positionₙ⁺, ρₙ⁺, ∇Cᵢ, ∇◌rᵢ
 end
 
-function AllocateThreadedArrays(SimMetaData, SimParticles, dρdtI, ∇Cᵢ, ∇◌rᵢ)
+function AllocateAtomicState(SimMetaData, n)
 
-    n = length(dρdtI)
     locks = [ReentrantLock() for _ in 1:n]
     step = Ref{Int}(0)
 
     nt = (
         locks = locks,
         step = step,
-        dρdtI = dρdtI,
-        Acceleration = SimParticles.Acceleration,
         dρdtI_touched = zeros(Int, n),
         Acceleration_touched = zeros(Int, n),
     )
 
     if SimMetaData.FlagOutputKernelValues
         nt = merge(nt, (
-            Kernel = SimParticles.Kernel,
-            KernelGradient = SimParticles.KernelGradient,
             Kernel_touched = zeros(Int, n),
             KernelGradient_touched = zeros(Int, n),
         ))
@@ -163,8 +158,6 @@ function AllocateThreadedArrays(SimMetaData, SimParticles, dρdtI, ∇Cᵢ, ∇�
 
     if SimMetaData.FlagShifting
         nt = merge(nt, (
-            ∇Cᵢ = ∇Cᵢ,
-            ∇◌rᵢ = ∇◌rᵢ,
             ∇Cᵢ_touched = zeros(Int, n),
             ∇◌rᵢ_touched = zeros(Int, n),
         ))

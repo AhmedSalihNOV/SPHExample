@@ -25,8 +25,8 @@ function show(io::IO, sc::SimulationConstants{T}) where {T}
     end
 end
 
-function show(io::IO, meta::SimulationMetaData{D, T}) where {D, T}
-    println(io, "SimulationMetaData{$D, $T}")
+function show(io::IO, meta::SimulationMetaData{D, T, S}) where {D, T, S}
+    println(io, "SimulationMetaData{$D, $T, $S}")
     for field in fieldnames(typeof(meta))
         val = getfield(meta, field)
         repr = _val_repr(val)

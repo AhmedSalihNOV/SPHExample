@@ -27,8 +27,8 @@ let
     # Load in particles
     SimParticles = AllocateDataStructures(SimulationGeometry)
 
-    SimMetaDataDambreak  = SimulationMetaData{Dimensions,FloatType}(
-        SimulationName="DamBreak2D", 
+    SimMetaDataDambreak  = SimulationMetaData{Dimensions,FloatType,ShiftingDisabled}(
+        SimulationName="DamBreak2D",
         SaveLocation="C:/TestSimulations/DamBreak2D_MDBC/",
         SimulationTime=2,
         OutputTimes=collect(0.01:0.01:2),

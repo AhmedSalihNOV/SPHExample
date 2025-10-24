@@ -4,10 +4,14 @@ using TimerOutputs
 using ProgressMeter
 using Base: @kwdef
 
-export SimulationMetaData
+abstract type ShiftingMode end
+struct ShiftingEnabled  <: ShiftingMode end
+struct ShiftingDisabled <: ShiftingMode end
+
+export SimulationMetaData, ShiftingEnabled, ShiftingDisabled
 
 
-@kwdef mutable struct SimulationMetaData{Dimensions, FloatType <: AbstractFloat}
+@kwdef mutable struct SimulationMetaData{Dimensions, FloatType <: AbstractFloat, S<:ShiftingMode}
     SimulationName::String
     SaveLocation::String
     HourGlass::TimerOutput                  = TimerOutput()
@@ -42,7 +46,7 @@ export SimulationMetaData
     OpenLogFile::Bool                       = true
     FlagOutputKernelValues::Bool            = false
     FlagLog::Bool                           = false
-    FlagShifting::Bool                      = false
+    shifting_mode::S                        = ShiftingDisabled()
     FlagSingleStepTimeStepping::Bool        = false
     ChunkMultiplier::Int                    = 1
     FlagMDBCSimple::Bool                    = false

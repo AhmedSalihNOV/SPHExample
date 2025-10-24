@@ -33,7 +33,7 @@ let
     SimParticles = AllocateDataStructures(SimulationGeometry)
 
     # --- Simulation metadata & logging ---
-    SimMetaDataDambreak3D = SimulationMetaData{Dimensions,FloatType}(
+    SimMetaDataDambreak3D = SimulationMetaData{Dimensions,FloatType,ShiftingDisabled}(
         SimulationName         = "DamBreak3D_Test",
         SaveLocation           = "C:/TestSimulations/TESTING_CPU_3DDambreak",
         SimulationTime         = 1.6,

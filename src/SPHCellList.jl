@@ -330,11 +330,10 @@ using Bumper
         n = length(target_array)
         num_threads = nthreads()
         chunk_size = ceil(Int, n / num_threads)
-        @inbounds @threads for t in 1:num_threads
-            local start_idx = 1 + (t-1) * chunk_size
-            local end_idx = min(t * chunk_size, n)
-            for j in eachindex(arrays)
-                local array = arrays[j]  # Access array only once per thread
+        for array in arrays
+            @inbounds @threads for t in 1:num_threads
+                local start_idx = 1 + (t - 1) * chunk_size
+                local end_idx = min(t * chunk_size, n)
                 @simd ivdep for i in start_idx:end_idx
                     @inbounds target_array[i] += array[i]
                 end

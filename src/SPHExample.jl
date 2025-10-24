@@ -15,6 +15,7 @@ module SPHExample
         "PreProcess.jl",
         "OpenExternalPrograms.jl",
         "SPHDensityDiffusionModels.jl",
+        "SPHMeasurements.jl",
         "SPHCellList.jl",
         "CustomPrettyPrinting.jl",
     ]
@@ -32,6 +33,9 @@ module SPHExample
 
     using .SPHDensityDiffusionModels
     export SPHDensityDiffusion, ZeroDensityDiffusion, ZeroGravityLinearDensityDiffusion, LinearDensityDiffusion, ZeroGravityComplexDensityDiffusion, ComplexDensityDiffusion, compute_density_diffusion
+
+    using .SPHMeasurements
+    export SimulationMeasurements
  
     using .SimulationGeometry
     export ParticleType, Fixed, Fluid, Moving, Geometry, MotionDetails

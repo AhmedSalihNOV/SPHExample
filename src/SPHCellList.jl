@@ -17,6 +17,7 @@ using ..OpenExternalPrograms
 using ..SPHKernels
 using ..SPHViscosityModels
 using ..SPHDensityDiffusionModels
+using ..SPHMeasurements
 
 import StructArrays: StructArray, foreachfield
 import LinearAlgebra: dot, norm, diagm, diag, cond, det
@@ -638,6 +639,7 @@ using Bumper
         SimParticles::StructArray,
         SimViscosity::SV,
         SimDensityDiffusion::SDD,
+        SimMeasurements::Union{Nothing, SimulationMeasurements} = nothing,
         ParticleNormalsPath::Union{Nothing,String} = nothing
         ) where {Dimensions,FloatType,SV<:SPHViscosity,SDD<:SPHDensityDiffusion}
 

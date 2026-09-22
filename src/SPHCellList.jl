@@ -18,7 +18,7 @@ using ..SPHDensityDiffusionModels
 using ..SPHNeighborList: BuildNeighborCellLists!, ComputeCellNeighborCounts, ComputeCellParticleCounts, ConstructStencil, ExtractCells!, FindCellIndex, MapFloor, NeighborParticleRanges, NeighborSortScratch, PackedNeighborCellLists, UpdateNeighbors!, UpdateΔx!
 
 using Base.Threads: @threads, nthreads, Atomic, atomic_add!
-using Bumper: @alloc, @no_escape
+using Bumper: Bumper, @alloc, @no_escape, default_buffer
 using FastPow: @fastpow
 using LinearAlgebra: det, dot, norm
 using Parameters: @unpack
@@ -692,9 +692,13 @@ using TimerOutputs: @timeit, flatten
                                  ) where {D,T,S<:ShiftingMode,K<:KernelOutputMode,L<:LogMode}
         @no_escape begin
             @timeit SimMetaData.HourGlass "01 Acquire MDBC buffers" begin
+                # Use Bumper.alloc! on the active default buffer instead of @alloc here:
+                # TimerOutputs >= 1.2 fully macro-expands @timeit block bodies, which
+                # expands @alloc before the enclosing @no_escape can rewrite it and
+                # fails with "may only be used inside of a @no_escape block".
                 DimensionsPlus = D + 1
-                bᵧ = @alloc(SVector{DimensionsPlus, T}, length(SimParticles.Position))
-                Aᵧ = @alloc(SMatrix{DimensionsPlus, DimensionsPlus, T, DimensionsPlus*DimensionsPlus}, length(SimParticles.Position))
+                bᵧ = Bumper.alloc!(default_buffer(), SVector{DimensionsPlus, T}, length(SimParticles.Position))
+                Aᵧ = Bumper.alloc!(default_buffer(), SMatrix{DimensionsPlus, DimensionsPlus, T, DimensionsPlus*DimensionsPlus}, length(SimParticles.Position))
             end
             UniqueCellsView = view(UniqueCells, 1:SimMetaData.IndexCounter)
             if CellIndexMap === nothing

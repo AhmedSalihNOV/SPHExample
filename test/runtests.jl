@@ -29,7 +29,7 @@ include("output_writer_cache.jl")
     @test alloc == 0
 end
 
-@testset "neighbor rebuild reuses cell index map" begin
+@testset "neighbor cell lists use the sorted cell search" begin
     UniqueCells = CartesianIndex{2}[
         CartesianIndex(0, 0),
         CartesianIndex(1, 0),
@@ -38,16 +38,20 @@ end
     ParticleRanges = [1, 2, 3, 4]
     FullStencil = ConstructStencil(Val(2))
     NeighborCellLists = [Int[] for _ in eachindex(UniqueCells)]
-    CellIndexMap = Dict{CartesianIndex{2}, Int}()
 
-    BuildNeighborCellLists!(NeighborCellLists, FullStencil, UniqueCells, ParticleRanges, CellIndexMap)
-    @test CellIndexMap[CartesianIndex(1, 0)] == 2
-    @test CellIndexMap[CartesianIndex(0, 1)] == 3
+    BuildNeighborCellLists!(NeighborCellLists, FullStencil, UniqueCells, ParticleRanges)
+    @test NeighborCellLists == [[2, 3], [1, 3], [1, 2]]
+    @test FindCellIndex(UniqueCells, CartesianIndex(1, 0)) == 2
+    @test FindCellIndex(UniqueCells, CartesianIndex(2, 2)) == 1
 
-    empty!(CellIndexMap)
-    BuildNeighborCellLists!(NeighborCellLists, FullStencil, UniqueCells, ParticleRanges, CellIndexMap)
-    @test CellIndexMap[CartesianIndex(0, 0)] == 1
-    @test get(CellIndexMap, CartesianIndex(2, 2), 1) == 1
+    # Cells that no longer own particles disappear from every stencil, exactly
+    # as with the previous per-rebuild dictionary, in both list formats.
+    ParticleRanges .= [1, 2, 2, 4]
+    BuildNeighborCellLists!(NeighborCellLists, FullStencil, UniqueCells, ParticleRanges)
+    @test NeighborCellLists == [[3], Int[], [1]]
+    Packed = PackedNeighborCellLists(length(UniqueCells))
+    BuildNeighborCellLists!(Packed, FullStencil, UniqueCells, ParticleRanges)
+    @test [collect(Packed[Index]) for Index in eachindex(UniqueCells)] == NeighborCellLists
 end
 
 @testset "gravity does not mutate carried acceleration" begin

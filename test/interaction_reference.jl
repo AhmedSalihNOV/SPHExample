@@ -15,7 +15,7 @@ using LinearAlgebra: norm
 
         ViscosityI, ViscosityJ = compute_viscosity(
             Laminar(), Kernel, Constants, Particles, Displacement,
-            VelocityDifference, Gradient, T(1), 1, 2,
+            VelocityDifference, Gradient, T(1), T(4), T(6), inv(T(4)), inv(T(6)), 1, 2,
         )
         Expected = SVector{2,T}(-8//25, -12//25)
         @test ViscosityI ≈ Expected rtol=8eps(T)
@@ -90,6 +90,7 @@ function CheckedInteractionReference(Case, Diffusion, Viscosity, Shifting, Kerne
     KernelGradients = copy(Particles.KernelGradient)
     ShiftC = fill(VectorType(ntuple(_ -> T(-9), length(first(Position)))), Count)
     ShiftR = fill(T(-9), Count)
+    InvDensity = inv.(Density)
 
     for i in eachindex(Position)
         Accumulators = (zero(T), zero(VectorType))
@@ -109,7 +110,7 @@ function CheckedInteractionReference(Case, Diffusion, Viscosity, Shifting, Kerne
         for j in Neighbors
             Accumulators = SPHExample.SPHCellList.ComputeInteractionsPerParticle!(
                 Diffusion, Viscosity, Kernel, MetaData, Constants, Particles,
-                Position, Density, Pressure, Velocity, Particles.Type,
+                Position, Density, InvDensity, Pressure, Velocity, Particles.Type,
                 Accumulators..., i, j,
             )
         end
@@ -144,7 +145,7 @@ end
             Count = length(Particles)
             DensityRate = fill(T(-9), Count)
             Acceleration = fill(SVector{D,T}(ntuple(_ -> T(-9), D)), Count)
-            AccelerationMax = fill(T(-9), Count)
+            AccelerationNormSquared = fill(T(-9), Count)
             ShiftC = fill(SVector{D,T}(ntuple(_ -> T(-9), D)), Count)
             ShiftR = fill(T(-9), Count)
             OriginalState = deepcopy((Particles.Position, Particles.Density, Particles.Velocity, Particles.Pressure))
@@ -152,7 +153,7 @@ end
             SPHExample.SPHCellList.NeighborLoopPerParticle!(
                 Diffusion, Viscosity, Kernel, MetaData, Constants, Particles,
                 ParticleRanges, CellListIndices, NeighborCellLists, DensityRate,
-                Acceleration, ShiftC, ShiftR, AccelerationMax;
+                Acceleration, ShiftC, ShiftR, AccelerationNormSquared;
                 Position, Density, Pressure, Velocity,
             )
             # Scalar calls and compiled threaded loops can differ by a few ulps,
@@ -166,7 +167,7 @@ end
             @test all(isapprox.(Particles.KernelGradient, Expected.KernelGradients; rtol=Tolerance, atol=Tolerance * maximum(norm, Expected.KernelGradients)))
             @test all(isapprox.(ShiftC, Expected.ShiftC; rtol=Tolerance, atol=Tolerance * maximum(norm, Expected.ShiftC)))
             @test all(isapprox.(ShiftR, Expected.ShiftR; rtol=Tolerance, atol=Tolerance * maximum(norm, Expected.ShiftR)))
-            @test AccelerationMax ≈ norm.(Acceleration) rtol=8eps(T)
+            @test AccelerationNormSquared ≈ sum.(abs2, Acceleration) rtol=8eps(T)
             @test all(isfinite, DensityRate)
             @test all(V -> all(isfinite, V), Acceleration)
             @test any(X -> !iszero(X), Acceleration)
@@ -185,23 +186,12 @@ end
             end
             @test_throws BoundsError SPHExample.SPHCellList.ComputeInteractionsPerParticle!(
                 Diffusion, Viscosity, Kernel, MetaData, Constants, Particles,
-                Position, Density, Pressure, Velocity, Particles.Type,
+                Position, Density, inv.(Density), Pressure, Velocity, Particles.Type,
                 Accumulators..., 1, Count + 1,
             )
-            Displacement = Position[1] - Position[2]
-            Gradient = zero(SVector{D,T})
-            if !(Diffusion isa ZeroDensityDiffusion)
-                @test_throws BoundsError compute_density_diffusion(
-                    Diffusion, Kernel, Constants, Particles, Displacement, Gradient,
-                    Constants.dx^2, 0, 1, Particles.Type,
-                )
-            end
-            if !(Viscosity isa ZeroViscosity)
-                @test_throws BoundsError compute_viscosity(
-                    Viscosity, Kernel, Constants, Particles, Displacement,
-                    zero(SVector{D,T}), Gradient, Constants.dx^2, 0, 1,
-                )
-            end
+            # The models now receive pair densities from the loop instead of
+            # indexing particle arrays; their remaining indexed reads are covered
+            # in diffusion_boundary.jl.
         end
     end
 end
@@ -218,8 +208,8 @@ end
         function PairContribution(i, j)
             return SPHExample.SPHCellList.ComputeInteractionsPerParticle!(
                 ZeroDensityDiffusion(), ZeroViscosity(), Kernel, MetaData, Constants,
-                Particles, Particles.Position, Particles.Density, Particles.Pressure,
-                Particles.Velocity, Particles.Type, zero(T), zero(SVector{D,T}), i, j,
+                Particles, Particles.Position, Particles.Density, inv.(Particles.Density),
+                Particles.Pressure, Particles.Velocity, Particles.Type, zero(T), zero(SVector{D,T}), i, j,
             )
         end
         DensityI, AccelerationI = PairContribution(i, j)

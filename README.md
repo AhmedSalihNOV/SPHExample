@@ -115,6 +115,25 @@ diffusion skips boundary pairs before evaluating its hydrostatic correction and
 distance reciprocal. In the measured solver cases, these changes preserved the
 timestep sequence and changed final fields only by floating-point roundoff.
 
+Each force evaluation now precomputes the reciprocal density of the state it
+reads (`FillInverseDensity!`), so the pair kernel and the viscosity and density
+diffusion models multiply by `1/ρ` instead of dividing per candidate pair.
+The models receive the pair densities `ρᵢ, ρⱼ` and their reciprocals from the
+loop rather than indexing `SimParticles.Density`; this also means midpoint
+evaluations consistently use the predictor density `ρₙ⁺` for every term,
+where previously viscosity and diffusion read the accepted density `ρⁿ`.
+The pair kernel no longer clamps `q`, because the accepted-pair guard
+`xᵢⱼ² <= H² = (2h)²` already bounds it, and it stores `‖a‖²` per particle so
+the CFL update takes one square root instead of one per particle. Neighbor
+cell lookups during rebuilds and MDBC ghost searches use a binary search over
+the sorted active-cell list (`FindCellIndex`) instead of a per-rebuild
+dictionary, with identical results.
+In the two-second StillWedge MDBC case on 24 threads (three warmed runs), these
+changes reduced median solver time from 3.07 s to 2.96 s (3.6% less) with an
+identical 4249-step timestep sequence. Because the density source changed, the
+final state differs by more than roundoff but remains small there: at most
+`1.8e-6 ρ₀` in density and `1e-5 m/s` in velocity against a `4.6e-3 m/s` peak.
+
 The particle and MDBC loops distribute contiguous batches of 64 particles using
 a shared atomic counter, so workers can take more work when they finish a batch.
 Single-threaded runs and small inputs use a serial path. Each particle retains

@@ -190,14 +190,19 @@ end
     return 1
 end
 
-function BuildNeighborCellLists!(NeighborCellLists, FullStencil, UniqueCellsView, ParticleRanges)
-    CellIndexMap = Dict{eltype(UniqueCellsView), Int}()
-    sizehint!(CellIndexMap, length(UniqueCellsView))
-    BuildNeighborCellLists!(NeighborCellLists, FullStencil, UniqueCellsView, ParticleRanges, CellIndexMap)
-    return nothing
+# Index of `Cell` when it is present and owns at least one particle, else 0.
+# `UpdateNeighbors!` leaves `UniqueCellsView` sorted, so a binary search
+# replaces the per-rebuild dictionary while finding exactly the same cells.
+@inline function OccupiedCellIndex(UniqueCellsView, ParticleRanges, Cell)
+    Index = searchsortedfirst(UniqueCellsView, Cell)
+    @inbounds if Index <= length(UniqueCellsView) && UniqueCellsView[Index] == Cell &&
+                 ParticleRanges[Index] < ParticleRanges[Index + 1]
+        return Index
+    end
+    return 0
 end
 
-function BuildNeighborCellLists!(NeighborCellLists, FullStencil, UniqueCellsView, ParticleRanges, CellIndexMap)
+function BuildNeighborCellLists!(NeighborCellLists, FullStencil, UniqueCellsView, ParticleRanges)
     TargetLen   = length(UniqueCellsView)
     OriginalLen = length(NeighborCellLists)
     resize!(NeighborCellLists, TargetLen)
@@ -210,14 +215,6 @@ function BuildNeighborCellLists!(NeighborCellLists, FullStencil, UniqueCellsView
         end
     end
 
-    empty!(CellIndexMap)
-    sizehint!(CellIndexMap, TargetLen)
-    @inbounds for CellIndex in eachindex(UniqueCellsView)
-        if ParticleRanges[CellIndex] < ParticleRanges[CellIndex + 1]
-            CellIndexMap[UniqueCellsView[CellIndex]] = CellIndex
-        end
-    end
-
     @inbounds for CellIndex in eachindex(UniqueCellsView)
         Neighbors = NeighborCellLists[CellIndex]
         empty!(Neighbors)
@@ -226,8 +223,7 @@ function BuildNeighborCellLists!(NeighborCellLists, FullStencil, UniqueCellsView
         end
         Cell = UniqueCellsView[CellIndex]
         for Offset in FullStencil
-            NeighborCell = Cell + Offset
-            NeighborIndex = get(CellIndexMap, NeighborCell, 0)
+            NeighborIndex = OccupiedCellIndex(UniqueCellsView, ParticleRanges, Cell + Offset)
             if !iszero(NeighborIndex) && NeighborIndex != CellIndex
                 push!(Neighbors, NeighborIndex)
             end
@@ -238,7 +234,7 @@ function BuildNeighborCellLists!(NeighborCellLists, FullStencil, UniqueCellsView
 end
 
 function BuildNeighborCellLists!(Lists::PackedNeighborCellLists{I}, FullStencil,
-                                 UniqueCellsView, ParticleRanges, CellIndexMap) where {I}
+                                 UniqueCellsView, ParticleRanges) where {I}
     CellCount = length(UniqueCellsView)
     CellCount <= typemax(I) || throw(ArgumentError("Cell count exceeds packed neighbor ID capacity"))
     resize!(Lists.Offsets, CellCount + 1)
@@ -250,13 +246,6 @@ function BuildNeighborCellLists!(Lists::PackedNeighborCellLists{I}, FullStencil,
         cld(length(FullStencil), max(size(FullStencil, 1), 1)) + 1 : length(FullStencil)
     sizehint!(Lists.Neighbors, CellCount * RunsPerCell)
     sizehint!(Lists.RunEnds, CellCount * RunsPerCell)
-    empty!(CellIndexMap)
-    sizehint!(CellIndexMap, CellCount)
-    @inbounds for CellIndex in eachindex(UniqueCellsView)
-        if ParticleRanges[CellIndex] < ParticleRanges[CellIndex + 1]
-            CellIndexMap[UniqueCellsView[CellIndex]] = CellIndex
-        end
-    end
     @inbounds for CellIndex in eachindex(UniqueCellsView)
         Lists.Offsets[CellIndex] = length(Lists.Neighbors) + 1
         if ParticleRanges[CellIndex] >= ParticleRanges[CellIndex + 1]
@@ -264,7 +253,7 @@ function BuildNeighborCellLists!(Lists::PackedNeighborCellLists{I}, FullStencil,
         end
         Cell = UniqueCellsView[CellIndex]
         for Offset in FullStencil
-            NeighborIndex = get(CellIndexMap, Cell + Offset, 0)
+            NeighborIndex = OccupiedCellIndex(UniqueCellsView, ParticleRanges, Cell + Offset)
             if !iszero(NeighborIndex) && NeighborIndex != CellIndex
                 if length(Lists.Neighbors) >= Lists.Offsets[CellIndex] &&
                    NeighborIndex == Int(Lists.RunEnds[end]) + 1

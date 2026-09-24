@@ -28,7 +28,6 @@ using LinearAlgebra: norm
         Cells = zeros(CartesianIndex{D}, N + 1)
         Indices = zeros(Int, N)
         Scratch = NeighborSortScratch(N)
-        CellMap = Dict{CartesianIndex{D},Int}()
         Lists = PackedNeighborCellLists(N + 1)
         b = fill(SVector{D+1,T}(ntuple(_ -> T(-1), D + 1)), N)
         A = fill(SMatrix{D+1,D+1,T}(ntuple(_ -> T(-1), (D + 1)^2)), N)
@@ -44,8 +43,8 @@ using LinearAlgebra: norm
             Count = UpdateNeighbors!(Particles, Kernel.H⁻¹, Scratch, Ranges, Cells, Indices)
             MetaData.IndexCounter = Count
             CellView = view(Cells, 1:Count)
-            BuildNeighborCellLists!(Lists, ConstructStencil(Val(D)), CellView, Ranges, CellMap)
-            SPH.UpdateMDBCNeighborCache!(Cache, Kernel, Particles, CellMap)
+            BuildNeighborCellLists!(Lists, ConstructStencil(Val(D)), CellView, Ranges)
+            SPH.UpdateMDBCNeighborCache!(Cache, Kernel, Particles, CellView)
             @test Cache.GhostIndices == findall(Point -> !iszero(Point), Particles.GhostPoints)
             for (GhostIndex, i) in enumerate(Cache.GhostIndices)
                 CachedNeighbors = Int[]
@@ -55,7 +54,7 @@ using LinearAlgebra: norm
                 end
                 GhostCell = SPH.f(Kernel, Particles.GhostPoints[i])
                 for Offset in ConstructStencil(Val(D))
-                    Cell = get(CellMap, GhostCell + Offset, 1)
+                    Cell = FindCellIndex(CellView, GhostCell + Offset)
                     append!(ReferenceNeighbors, Ranges[Cell]:(Ranges[Cell + 1] - 1))
                 end
                 @test CachedNeighbors == ReferenceNeighbors
@@ -63,16 +62,16 @@ using LinearAlgebra: norm
             for Evaluation in 1:2
                 # Densities change between evaluations without a cell rebuild.
                 Particles.Density .+= T(0.125)
-                SPH.NeighborLoopMDBC!(Kernel, MetaData, Constants, Ranges, CellView, CellMap, Particles, b, A, Cache)
-                SPH.NeighborLoopMDBC!(Kernel, MetaData, Constants, Ranges, CellView, CellMap, Particles, ReferenceB, ReferenceA)
+                SPH.NeighborLoopMDBC!(Kernel, MetaData, Constants, Ranges, CellView, Particles, b, A, Cache)
+                SPH.NeighborLoopMDBC!(Kernel, MetaData, Constants, Ranges, CellView, Particles, ReferenceB, ReferenceA)
                 # As in interaction_reference.jl, allow final-bit rounding from
                 # different compiler specializations; traversal above is exact.
                 Tolerance = 8eps(T)
                 @test all(isapprox.(b, ReferenceB; rtol=Tolerance, atol=Tolerance * maximum(norm, ReferenceB)))
                 @test all(isapprox.(A, ReferenceA; rtol=Tolerance, atol=Tolerance * maximum(norm, ReferenceA)))
                 CachedParticles, ReferenceParticles = deepcopy(Particles), deepcopy(Particles)
-                SPH.ApplyMDBCBeforeHalf!(MetaData, Kernel, Constants, CachedParticles, Ranges, Cells, CellMap, Cache)
-                SPH.ApplyMDBCBeforeHalf!(MetaData, Kernel, Constants, ReferenceParticles, Ranges, Cells, CellMap)
+                SPH.ApplyMDBCBeforeHalf!(MetaData, Kernel, Constants, CachedParticles, Ranges, Cells, Cache)
+                SPH.ApplyMDBCBeforeHalf!(MetaData, Kernel, Constants, ReferenceParticles, Ranges, Cells)
                 # Reconstruction also solves the small boundary matrix, amplifying
                 # final-bit differences in its inputs slightly.
                 @test all(isapprox.(CachedParticles.Density, ReferenceParticles.Density;
@@ -85,13 +84,14 @@ using LinearAlgebra: norm
         Particles.Type[Ghost] = Fluid
         @test SPH.MakeMDBCNeighborCache(MetaData, Particles) === nothing
         fill!(Particles.GhostPoints, zero(Offset))
-        SPH.UpdateMDBCNeighborCache!(Cache, Kernel, Particles, CellMap)
+        CellView = view(Cells, 1:MetaData.IndexCounter)
+        SPH.UpdateMDBCNeighborCache!(Cache, Kernel, Particles, CellView)
         @test isempty(Cache.GhostIndices) && isempty(Cache.NeighborCells)
         BeforeB, BeforeA = copy(b), copy(A)
-        SPH.NeighborLoopMDBC!(Kernel, MetaData, Constants, Ranges, view(Cells, 1:MetaData.IndexCounter), CellMap, Particles, b, A, Cache)
+        SPH.NeighborLoopMDBC!(Kernel, MetaData, Constants, Ranges, CellView, Particles, b, A, Cache)
         @test isequal(b, BeforeB) && isequal(A, BeforeA)
         EmptyParticles = Particles[1:0]
-        SPH.UpdateMDBCNeighborCache!(Cache, Kernel, EmptyParticles, CellMap)
+        SPH.UpdateMDBCNeighborCache!(Cache, Kernel, EmptyParticles, CellView)
         @test isempty(Cache.GhostIndices)
     end
     NoBoundaryMetaData = SimulationMetaData{2,Float64}(SimulationName="no_mdbc", SaveLocation=".")

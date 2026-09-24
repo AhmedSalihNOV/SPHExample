@@ -34,20 +34,21 @@ function Δt(max_acceleration, SimulationConstants, SPHKernel)
 end
 
 """
-    UpdateTimeStep(AccelerationMax, SimConstants, SimKernel)
+    UpdateTimeStep(AccelerationNormSquared, SimConstants, SimKernel)
 
 Computes and returns the updated time step based on maximum acceleration across all particles.
 
 # Arguments
-- `AccelerationMax`: Array of acceleration magnitudes for each particle.
+- `AccelerationNormSquared`: Array of squared acceleration magnitudes for each particle.
+  The pair loop stores `‖a‖²` so the square root is taken once here rather than per particle.
 - `SimConstants`: Struct containing simulation parameters.
 - `SimKernel`: Struct containing kernel parameters.
 
 # Returns
 - The calculated adaptive time step `dt`.
 """
-function UpdateTimeStep(AccelerationMax, SimConstants, SimKernel)
-    max_acceleration = maximum(AccelerationMax)
+function UpdateTimeStep(AccelerationNormSquared, SimConstants, SimKernel)
+    max_acceleration = sqrt(maximum(AccelerationNormSquared))
     return Δt(max_acceleration, SimConstants, SimKernel)
 end
 

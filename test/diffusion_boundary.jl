@@ -11,6 +11,8 @@ using StructArrays
         Gradient = -Displacement
         DistanceSquared = sum(abs2, Displacement)
         Particles = StructArray((Density=T[1001, 1003], Type=ParticleType[Fluid, Fluid]))
+        ρᵢ, ρⱼ = Particles.Density
+        ρᵢ⁻¹, ρⱼ⁻¹ = inv(ρᵢ), inv(ρⱼ)
         # The existing inverse-hydrostatic estimator used by the complex model
         # relies on Float64 bit layout. Cover its supported precision here.
         Models = T === Float64 ? (LinearDensityDiffusion(), ComplexDensityDiffusion()) : (LinearDensityDiffusion(),)
@@ -18,16 +20,17 @@ using StructArrays
             for Typeᵢ in (Fluid, Fixed, Moving), Typeⱼ in (Fluid, Fixed, Moving)
                 Particles.Type .= (Typeᵢ, Typeⱼ)
                 Dᵢ, Dⱼ = compute_density_diffusion(Model, Kernel, Constants, Particles,
-                    Displacement, Gradient, DistanceSquared, 1, 2, Particles.Type)
+                    Displacement, Gradient, DistanceSquared, ρᵢ, ρⱼ, ρᵢ⁻¹, ρⱼ⁻¹, 1, 2, Particles.Type)
                 @test typeof(Dᵢ) === T
                 @test Dⱼ == -Dᵢ
                 @test iszero(Dᵢ) == (Typeᵢ != Fluid || Typeⱼ != Fluid)
             end
+            # These models still index the particle types, so an invalid index remains checked.
             @test_throws BoundsError compute_density_diffusion(Model, Kernel, Constants, Particles,
-                Displacement, Gradient, DistanceSquared, 1, 3, Particles.Type)
+                Displacement, Gradient, DistanceSquared, ρᵢ, ρⱼ, ρᵢ⁻¹, ρⱼ⁻¹, 1, 3, Particles.Type)
         end
         # This separate model intentionally applies diffusion at boundaries.
         @test !iszero(first(compute_density_diffusion(ZeroGravityLinearDensityDiffusion(),
-            Kernel, Constants, Particles, Displacement, Gradient, DistanceSquared, 1, 2, Particles.Type)))
+            Kernel, Constants, Particles, Displacement, Gradient, DistanceSquared, ρᵢ, ρⱼ, ρᵢ⁻¹, ρⱼ⁻¹, 1, 2, Particles.Type)))
     end
 end

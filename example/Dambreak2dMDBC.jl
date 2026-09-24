@@ -49,13 +49,13 @@ let
     # using Parameters
     # using LinearAlgebra
     # struct MyTurbulenceModel <: SPHViscosity end
-    # @inline function SPHExample.compute_viscosity(::MyTurbulenceModel, SimKernel, SimConstants, SimParticles, xᵢⱼ, vᵢⱼ, ∇ᵢWᵢⱼ, i, j)
+    # @inline function SPHExample.compute_viscosity(::MyTurbulenceModel, SimKernel, SimConstants, SimParticles, xᵢⱼ, vᵢⱼ, ∇ᵢWᵢⱼ, d², ρᵢ, ρⱼ, ρᵢ⁻¹, ρⱼ⁻¹, i, j)
     #     @unpack ρ₀, m₀, α, γ, g, c₀, δᵩ, Cb, Cb⁻¹, ν₀, dx, SmagorinskyConstant, BlinConstant = SimConstants
     #     @unpack h, η² = SimKernel
 
-    #     dᵢⱼ =  sqrt(abs(dot(xᵢⱼ,xᵢⱼ)))
-    #     ρᵢ  = SimParticles.Density[i]
-    #     ρⱼ  = SimParticles.Density[j]
+    #     # ρᵢ, ρⱼ are the pair densities of the evaluated state and ρᵢ⁻¹, ρⱼ⁻¹
+    #     # their precomputed reciprocals; d² is the squared pair distance.
+    #     dᵢⱼ =  sqrt(abs(d²))
 
     #     invd²η²   =  1.0 / (dᵢⱼ*dᵢⱼ+η²)
     #     ρ̄ = (ρᵢ + ρⱼ) * 0.5

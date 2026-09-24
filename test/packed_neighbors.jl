@@ -32,14 +32,13 @@ using SPHExample
         # Exercise sentinel/empty cells, missing cells, shrinking, and regrowth.
         Packed = PackedNeighborCellLists(length(AllCells))
         Legacy = Vector{Int}[]
-        Map = Dict{CartesianIndex{D},Int}()
         for Stride in (1, 3, 1)
             Cells = AllCells[1:Stride:end]
             Ranges = ones(Int, length(Cells) + 1)
             for Index in eachindex(Cells)
                 Ranges[Index + 1] = Ranges[Index] + (Index == 1 || Index % 11 == 0 ? 0 : Index % 3 + 1)
             end
-            BuildNeighborCellLists!(Packed, ConstructStencil(Val(D)), Cells, Ranges, Map)
+            BuildNeighborCellLists!(Packed, ConstructStencil(Val(D)), Cells, Ranges)
             BuildNeighborCellLists!(Legacy, ConstructStencil(Val(D)), Cells, Ranges)
             @test length(Packed) == length(Legacy)
             @test length(Packed.Neighbors) == length(Packed.RunEnds)

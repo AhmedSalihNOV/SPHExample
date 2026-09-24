@@ -15,13 +15,13 @@ function CheckParticleCacheReference(Case, Cache, Diffusion, Viscosity,
     Count = length(Position)
     DensityRate = fill(T(-9), Count)
     Acceleration = fill(VectorType(ntuple(_ -> T(-9), length(VectorType))), Count)
-    AccelerationMax = fill(T(-9), Count)
+    AccelerationNormSquared = fill(T(-9), Count)
     ShiftC = copy(Acceleration)
     ShiftR = copy(DensityRate)
     SPHExample.SPHCellList.EvaluateInteractions!(
         Cache, Diffusion, Viscosity, Kernel, MetaData, Constants, Particles,
         ParticleRanges, CellListIndices, NeighborCellLists, DensityRate,
-        Acceleration, ShiftC, ShiftR, AccelerationMax;
+        Acceleration, ShiftC, ShiftR, AccelerationNormSquared;
         Position, Density, Pressure, Velocity,
     )
     for (Actual, Reference) in ((DensityRate, Expected.DensityRate),
@@ -31,7 +31,7 @@ function CheckParticleCacheReference(Case, Cache, Diffusion, Viscosity,
                                 (ShiftC, Expected.ShiftC), (ShiftR, Expected.ShiftR))
         @test all(isapprox.(Actual, Reference; rtol=8eps(T), atol=8eps(T) * maximum(norm, Reference)))
     end
-    @test AccelerationMax ≈ norm.(Acceleration) rtol=8eps(T)
+    @test AccelerationNormSquared ≈ sum.(abs2, Acceleration) rtol=8eps(T)
     return (; DensityRate, Acceleration)
 end
 

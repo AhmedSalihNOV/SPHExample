@@ -22,6 +22,10 @@ abstract type SPHDensityDiffusion end
 
 # Propagate the neighbor loop's @inbounds context to particle-array reads.
 # Calls made outside that context retain their ordinary bounds checks.
+#
+# Every model receives the pair densities of the evaluated state (the
+# predictor density during midpoint evaluations) and their precomputed
+# reciprocals from the pair loop, so no model reloads or divides by density.
 
 #---------------------------------------------------------------
 # 1) ZeroDensityDiffusion(): ignore all diffusion
@@ -41,6 +45,10 @@ Base.@propagate_inbounds function compute_density_diffusion(
         xᵢⱼ,
         ∇ᵢWᵢⱼ,
         d²,
+        ρᵢ,
+        ρⱼ,
+        ρᵢ⁻¹,
+        ρⱼ⁻¹,
         i,
         j,
         ParticleType
@@ -65,6 +73,10 @@ Base.@propagate_inbounds function compute_density_diffusion(
         xᵢⱼ,
         ∇ᵢWᵢⱼ,
         d²,
+        ρᵢ,
+        ρⱼ,
+        ρᵢ⁻¹,
+        ρⱼ⁻¹,
         i,
         j,
         ParticleType
@@ -73,17 +85,14 @@ Base.@propagate_inbounds function compute_density_diffusion(
         @unpack ρ₀, m₀, c₀, δᵩ, Cb, Cb⁻¹, γ    = SimConstants
         @unpack h, η²                          = SimKernel
 
-        ρᵢ  = SimParticles.Density[i]
-        ρⱼ  = SimParticles.Density[j]
-
         # g == 0 => skip any hydrostatic parts
-        
+
         invdᵢⱼ²η² = one(eltype(ρᵢ)) / (d² + η²)
 
         ρⱼᵢ = ρⱼ - ρᵢ
         ψᵢⱼ = 2 * ρⱼᵢ * (-xᵢⱼ) * invdᵢⱼ²η²
 
-        Dᵢ  = δᵩ * h * c₀ * (m₀/ρⱼ) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ)
+        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ)
         Dⱼ  = -Dᵢ
 
 
@@ -109,6 +118,10 @@ Base.@propagate_inbounds function compute_density_diffusion(
         xᵢⱼ,
         ∇ᵢWᵢⱼ,
         d²,
+        ρᵢ,
+        ρⱼ,
+        ρᵢ⁻¹,
+        ρⱼ⁻¹,
         i,
         j,
         ParticleType
@@ -127,19 +140,16 @@ Base.@propagate_inbounds function compute_density_diffusion(
 
         Linear_ρ_factor = (1/(Cb*γ))*ρ₀
 
-        ρᵢ  = SimParticles.Density[i]
-        ρⱼ  = SimParticles.Density[j]
-
         Pᵢⱼᴴ  = ρ₀ * (-g) * -xᵢⱼ[end]
         ρᵢⱼᴴ  = Pᵢⱼᴴ * Linear_ρ_factor
 
-        
+
         invdᵢⱼ²η² = one(eltype(ρᵢ)) / (d² + η²)
 
         ρⱼᵢ = ρⱼ - ρᵢ
         ψᵢⱼ = 2 * (ρⱼᵢ - ρᵢⱼᴴ)  * (-xᵢⱼ) * invdᵢⱼ²η²
 
-        Dᵢ  = δᵩ * h * c₀ * (m₀/ρⱼ) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ)
+        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ)
         Dⱼ  = -Dᵢ
 
         return Dᵢ, Dⱼ
@@ -166,6 +176,10 @@ Base.@propagate_inbounds function compute_density_diffusion(
         xᵢⱼ,
         ∇ᵢWᵢⱼ,
         d²,
+        ρᵢ,
+        ρⱼ,
+        ρᵢ⁻¹,
+        ρⱼ⁻¹,
         i,
         j,
         ParticleType
@@ -182,9 +196,6 @@ Base.@propagate_inbounds function compute_density_diffusion(
         @unpack ρ₀, m₀, c₀, δᵩ, Cb, Cb⁻¹, γ, g = SimConstants
         @unpack h, η²                          = SimKernel
 
-        ρᵢ  = SimParticles.Density[i]
-        ρⱼ  = SimParticles.Density[j]
-
         # In theory these two equations are not completely symmetric.
         # In practice it is 'good' enough and saves a lot of time to
         # not do it the mathematically correct way.
@@ -192,7 +203,7 @@ Base.@propagate_inbounds function compute_density_diffusion(
         ρᵢⱼᴴ  = InverseHydrostaticEquationOfState(ρ₀, Pᵢⱼᴴ, Cb⁻¹)
         # ρᵢⱼᴴ = ρ₀ * ( Estimate7thRoot( 1 + (Pᵢⱼᴴ * Cb⁻¹)) - 1)
         # ρⱼᵢᴴ  = InverseHydrostaticEquationOfState(ρ₀, Pⱼᵢᴴ, Cb⁻¹)
-        
+
         invdᵢⱼ²η² = one(eltype(ρᵢ)) / (d² + η²)
 
         ρⱼᵢ = ρⱼ - ρᵢ
@@ -200,7 +211,7 @@ Base.@propagate_inbounds function compute_density_diffusion(
 
         MotionLimiterCondition = MotionLimiterValue(eltype(ρᵢ), ParticleType[i]) * MotionLimiterValue(eltype(ρᵢ), ParticleType[j])
 
-        Dᵢ  = δᵩ * h * c₀ * (m₀/ρⱼ) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ) * MotionLimiterCondition
+        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ) * MotionLimiterCondition
         Dⱼ  = -Dᵢ
 
         return Dᵢ, Dⱼ

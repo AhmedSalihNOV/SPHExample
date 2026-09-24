@@ -22,8 +22,13 @@ using StructArrays
                 Dᵢ, Dⱼ = compute_density_diffusion(Model, Kernel, Constants, Particles,
                     Displacement, Gradient, DistanceSquared, ρᵢ, ρⱼ, ρᵢ⁻¹, ρⱼ⁻¹, 1, 2, Particles.Type)
                 @test typeof(Dᵢ) === T
-                @test Dⱼ == -Dᵢ
                 @test iszero(Dᵢ) == (Typeᵢ != Fluid || Typeⱼ != Fluid)
+                # The j-side value is exactly what j computes as the center, so
+                # the symmetric pair loop reproduces the per-particle loop.
+                Dⱼ′, Dᵢ′ = compute_density_diffusion(Model, Kernel, Constants, Particles,
+                    -Displacement, -Gradient, DistanceSquared, ρⱼ, ρᵢ, ρⱼ⁻¹, ρᵢ⁻¹, 2, 1, Particles.Type)
+                @test Dⱼ == Dⱼ′
+                @test Dᵢ == Dᵢ′
             end
             # These models still index the particle types, so an invalid index remains checked.
             @test_throws BoundsError compute_density_diffusion(Model, Kernel, Constants, Particles,

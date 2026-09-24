@@ -92,8 +92,11 @@ Base.@propagate_inbounds function compute_density_diffusion(
         ρⱼᵢ = ρⱼ - ρᵢ
         ψᵢⱼ = 2 * ρⱼᵢ * (-xᵢⱼ) * invdᵢⱼ²η²
 
-        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ)
-        Dⱼ  = -Dᵢ
+        # ψⱼᵢ equals ψᵢⱼ exactly and ∇ⱼWᵢⱼ = -∇ᵢWᵢⱼ, so Dⱼ is what particle j
+        # computes as the center, not merely -Dᵢ.
+        ψ∇W = dot(ψᵢⱼ, ∇ᵢWᵢⱼ)
+        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * ψ∇W
+        Dⱼ  = δᵩ * h * c₀ * (m₀ * ρᵢ⁻¹) * -ψ∇W
 
 
         return Dᵢ, Dⱼ
@@ -149,8 +152,11 @@ Base.@propagate_inbounds function compute_density_diffusion(
         ρⱼᵢ = ρⱼ - ρᵢ
         ψᵢⱼ = 2 * (ρⱼᵢ - ρᵢⱼᴴ)  * (-xᵢⱼ) * invdᵢⱼ²η²
 
-        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ)
-        Dⱼ  = -Dᵢ
+        # The linear hydrostatic term is exactly antisymmetric, so ψⱼᵢ equals
+        # ψᵢⱼ and Dⱼ is what particle j computes as the center.
+        ψ∇W = dot(ψᵢⱼ, ∇ᵢWᵢⱼ)
+        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * ψ∇W
+        Dⱼ  = δᵩ * h * c₀ * (m₀ * ρᵢ⁻¹) * -ψ∇W
 
         return Dᵢ, Dⱼ
 end
@@ -212,7 +218,15 @@ Base.@propagate_inbounds function compute_density_diffusion(
         MotionLimiterCondition = MotionLimiterValue(eltype(ρᵢ), ParticleType[i]) * MotionLimiterValue(eltype(ρᵢ), ParticleType[j])
 
         Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ) * MotionLimiterCondition
-        Dⱼ  = -Dᵢ
+
+        # The inverse equation of state is not antisymmetric in the pressure
+        # sign, so evaluate what particle j computes as the center exactly
+        # (with -xᵢⱼ and -∇ᵢWᵢⱼ) rather than negating Dᵢ.
+        Pⱼᵢᴴ  = ρ₀ * (-g) * xᵢⱼ[end]
+        ρⱼᵢᴴ  = InverseHydrostaticEquationOfState(ρ₀, Pⱼᵢᴴ, Cb⁻¹)
+        ρᵢⱼ = ρᵢ - ρⱼ
+        ψⱼᵢ = 2 * (ρᵢⱼ - ρⱼᵢᴴ) * xᵢⱼ * invdᵢⱼ²η²
+        Dⱼ  = δᵩ * h * c₀ * (m₀ * ρᵢ⁻¹) * dot(ψⱼᵢ, -∇ᵢWᵢⱼ) * MotionLimiterCondition
 
         return Dᵢ, Dⱼ
 end

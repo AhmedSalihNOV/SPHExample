@@ -139,27 +139,31 @@ a shared atomic counter, so workers can take more work when they finish a batch.
 Single-threaded runs and small inputs use a serial path. Each particle retains
 its neighbor summation order and owns its output writes.
 
-Three-dimensional runs with `NoShifting` and `NoKernelOutput` also cache
-particle candidates within `1.125H`. Before every force evaluation, including
-predictor states, the solver checks displacement from copied reference positions
-and rebuilds this cache if any particle has moved more than `H/32`. Two particles
-can therefore close by at most `H/16` during reuse, leaving half the `H/8` margin
-unused. Grid rebuilds and particle reordering invalidate the cache as well.
-The force cutoff remains `H`, and retained candidates keep their original order.
-The 2D and optional-output paths keep the original traversal because the measured
-2D benefit did not justify the additional storage.
+Runs with `NoShifting` and `NoKernelOutput` evaluate each particle pair once
+(`EvaluateInteractions!` with `SymmetricAccumulators`). A cell handles the
+pairs inside itself and those with its neighbor cells of higher index, and
+each pair evaluation yields both particles' contributions: the acceleration
+terms are exactly antisymmetric, the continuity term shares one dot product,
+and the density diffusion models return what the partner computes as the
+center (`compute_density_diffusion` returns `(Dᵢ, Dⱼ)` with `Dⱼ` evaluated
+exactly, not `-Dᵢ`). Every per-pair value therefore equals the per-particle
+loop's; only the summation order differs, by a few ulps.
+Workers take dynamic batches of owner cells and write to private accumulator
+copies, which a parallel pass then sums. This needs no atomics, colouring, or
+barriers inside the pair loop but costs `nthreads × N × (D+1)` floats
+(131 MB for 171,496 particles on 24 threads). Single-threaded runs accumulate
+directly. Modes with kernel or shifting outputs keep the per-particle loop.
 
-In the 17,446-particle 3D dam-break benchmark, this reduces initial candidates
-from 13.28 million to 3.93 million per evaluation. Six alternating warmed runs
-on Julia 1.12.7 with 32 default threads reduced median solver time from 0.533 s
-to 0.491 s (8.0% less time, 0.02 s simulated). Timesteps matched exactly and
-maximum scaled final-field error was `6.4e-13`. The compact cache adds about
-16.3 MB of reachable storage (932 bytes per particle in this geometry); capacity
-and rebuild allocations can require more. Gains depend on motion and geometry.
-
-This particle cache filters the existing cell candidates. It preserves the
-cell-grid coverage limitation described below; its distance margin does not
-expand the grid stencil to find previously excluded cells.
+Measured against the per-particle loop on the same neighbor structures,
+the symmetric loop needed 2.07–2.09× less time on one thread and 1.6–1.8×
+less on 24 threads: StillWedge (3,027 particles) 0.194 → 0.110 ms per
+evaluation, the 17,446-particle 3D dam break 3.22 → 1.89 ms, and the
+171,496-particle 3D dam break 51.3 → 30.7 ms, with results matching to
+`2e-15` of the field scale. This replaced the earlier 3D per-particle
+candidate cache, whose 8% gain the symmetric loop subsumes. End to end, the
+two-second StillWedge MDBC case on 24 threads (three warmed runs) dropped from
+2.96 s to 1.57 s median with an identical 4249-step sequence and final fields
+equal to roundoff (`4e-15 ρ₀` in density, `3e-14 m` in position).
 
 For fixed MDBC ghost points, neighboring cell indices are cached and only active
 ghosts are scheduled. The cache is refreshed after each neighbor rebuild and
@@ -230,7 +234,9 @@ a more promising speed target than merely rebuilding less often in this case.
 | Explicit neighbor skin and displacement validation | Moderate to large | Correctness prerequisite for safely tuning reuse; storage and search volume must be benchmarked |
 | Tighter bins or pruned cell searches | Moderate to large | May further reduce pair-loop work; the 3D particle candidate cache above already trades memory for fewer checks |
 | Thread-count and batch-size tuning | Low | Measure representative sizes; more threads can add overhead for small cases |
-| SIMD blocks or evaluating pair geometry once for both particles | Large | Requires careful accumulation, thread ownership, and model-specific physics checks |
+| Symmetric pair evaluation for kernel-output and shifting modes | Moderate | The default modes already evaluate each pair once (above); the optional-output loops still visit every pair from both sides |
+| Forward-only candidate lists on top of the symmetric loop | Moderate | About two thirds of cell candidates fail the distance check; a skin-based half list would also address the coverage limitation below |
+| SIMD blocks over pair batches | Large | Requires restructured data access; the per-pair scalar kernel is now the dominant cost |
 
 `ComplexDensityDiffusion` now skips the inverse hydrostatic equation of state
 for boundary pairs whose diffusion is disabled by the existing model. This

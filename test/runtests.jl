@@ -9,8 +9,12 @@ include("neighbor_sort.jl")
 include("packed_neighbors.jl")
 include("particle_batches.jl")
 include("interaction_reference.jl")
+include("particle_neighbor_cache.jl")
+include("mdbc_accumulation.jl")
+include("mdbc_neighbor_cache.jl")
 include("diffusion_boundary.jl")
 include("neighbor_rebuild_coverage.jl")
+include("output_writer_cache.jl")
 
 @testset "time stepping" begin
     pos = [SVector{2,Float64}(0.0, 0.0), SVector{2,Float64}(1.0, 0.0)]
@@ -145,7 +149,7 @@ function RunOutputCadenceCase(OutputTimes; SimulationEnd=1 // 4,
         length(Particles),
     )
 
-    MetaData.OutputIterationCounter = 1
+    MetaData.OutputIterationCounter = 0
     MetaData.CurrentTimeStep = Constants.CFL * Kernel.h / Constants.c₀
     EmittedTimes = T[zero(T)]
     function RecordOutput!()
@@ -241,15 +245,15 @@ end
         SaveLocation=".",
         SimulationTime=0.25,
         OutputTimes=[0.1, 0.2],
-        OutputIterationCounter=1,
+        OutputIterationCounter=0,
     )
     @test SPHExample.TimeStepping.next_output_time(ScheduleMetaData) == 0.1
-    ScheduleMetaData.OutputIterationCounter = 2
+    ScheduleMetaData.OutputIterationCounter = 1
     @test SPHExample.TimeStepping.next_output_time(ScheduleMetaData) == 0.2
-    ScheduleMetaData.OutputIterationCounter = 3
+    ScheduleMetaData.OutputIterationCounter = 2
     @test SPHExample.TimeStepping.next_output_time(ScheduleMetaData) == 0.25
     ScheduleMetaData.OutputTimes = [0.5]
-    ScheduleMetaData.OutputIterationCounter = 1
+    ScheduleMetaData.OutputIterationCounter = 0
     @test SPHExample.TimeStepping.next_output_time(ScheduleMetaData) == 0.25
 
     VectorMetaData, VectorState, VectorOutputs =
@@ -384,7 +388,6 @@ end
     end
 
     Parent = MetaData.HourGlass["MDBC parent"]
-    @test TimerOutputs.ncalls(Parent["01 Acquire MDBC buffers"]) == 1
     @test TimerOutputs.ncalls(Parent["02 NeighborLoopMDBC!"]) == 1
     @test TimerOutputs.ncalls(Parent["03 ApplyMDBCCorrection"]) == 1
     @test all(isfinite, Particles.Density)
@@ -404,7 +407,7 @@ end
     Report = String(take!(ReportBuffer))
     @test occursin("sorted by elapsed time", Report)
     @test occursin("globally sorted by allocations", Report)
-    @test occursin("01 Acquire MDBC buffers", Report)
+    @test occursin("02 NeighborLoopMDBC!", Report)
     @test all(Label -> occursin(Label, Report), VisibleLabels)
     @test !occursin("rows omitted", Report)
     @test !occursin("~Flattened~", Report)

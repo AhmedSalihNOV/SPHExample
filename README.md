@@ -28,6 +28,11 @@ The project demonstrates how to assemble a small SPH solver with Julia. It focus
 
 Time-stepping behavior is selected via `RunSimulation(..., SimTimeStepping=...)` with either
 `SymplecticTimeStepping()` or `SingleNeighborTimeStepping()` depending on the desired update path.
+`Laminar()` and the laminar part of `LaminarSPS()` use the viscosity pair
+denominator `(ρᵢ + ρⱼ) * (d² + η²)`, following the
+[DualSPHysics formulation](https://github.com/DualSPHysics/DualSPHysics/wiki/3.-SPH-formulation).
+This corrects an earlier addition in that denominator and changes results for
+simulations that select either viscosity model.
 
 ## Folder Structure
 
@@ -104,11 +109,44 @@ fields during sorting. Equal-cell order is preserved, including optional MDBC
 and kernel-output fields. Interaction helpers also propagate the neighbor loop's
 bounds-check guarantee; direct checked calls retain bounds checks. These changes
 preserve the force formulas, support radius, and integration settings.
+The Wendland C2 gradient also uses the kernel's precomputed inverse smoothing
+length, avoiding a division for each accepted particle pair. Linear density
+diffusion skips boundary pairs before evaluating its hydrostatic correction and
+distance reciprocal. In the measured solver cases, these changes preserved the
+timestep sequence and changed final fields only by floating-point roundoff.
 
 The particle and MDBC loops distribute contiguous batches of 64 particles using
 a shared atomic counter, so workers can take more work when they finish a batch.
 Single-threaded runs and small inputs use a serial path. Each particle retains
 its neighbor summation order and owns its output writes.
+
+Three-dimensional runs with `NoShifting` and `NoKernelOutput` also cache
+particle candidates within `1.125H`. Before every force evaluation, including
+predictor states, the solver checks displacement from copied reference positions
+and rebuilds this cache if any particle has moved more than `H/32`. Two particles
+can therefore close by at most `H/16` during reuse, leaving half the `H/8` margin
+unused. Grid rebuilds and particle reordering invalidate the cache as well.
+The force cutoff remains `H`, and retained candidates keep their original order.
+The 2D and optional-output paths keep the original traversal because the measured
+2D benefit did not justify the additional storage.
+
+In the 17,446-particle 3D dam-break benchmark, this reduces initial candidates
+from 13.28 million to 3.93 million per evaluation. Six alternating warmed runs
+on Julia 1.12.7 with 32 default threads reduced median solver time from 0.533 s
+to 0.491 s (8.0% less time, 0.02 s simulated). Timesteps matched exactly and
+maximum scaled final-field error was `6.4e-13`. The compact cache adds about
+16.3 MB of reachable storage (932 bytes per particle in this geometry); capacity
+and rebuild allocations can require more. Gains depend on motion and geometry.
+
+This particle cache filters the existing cell candidates. It preserves the
+cell-grid coverage limitation described below; its distance margin does not
+expand the grid stencil to find previously excluded cells.
+
+For fixed MDBC ghost points, neighboring cell indices are cached and only active
+ghosts are scheduled. The cache is refreshed after each neighbor rebuild and
+particle reordering. Moving or fluid ghost points retain the direct lookup path.
+Density and kernel contributions are still evaluated every time, in the original
+neighbor order; the cache does not change the timestep or neighbor-reuse policy.
 
 Neighbor-cell tables use `PackedNeighborCellLists`: contiguous arrays of
 unsigned start/end cell IDs plus native-integer offsets. Consecutive neighboring
@@ -171,7 +209,7 @@ a more promising speed target than merely rebuilding less often in this case.
 | Candidate | Effort | Main consideration |
 |---|---|---|
 | Explicit neighbor skin and displacement validation | Moderate to large | Correctness prerequisite for safely tuning reuse; storage and search volume must be benchmarked |
-| Tighter bins, pruned cell searches, or explicit particle candidate lists | Moderate to large | Reduce the dominant pair-loop work; explicit particle lists require more memory |
+| Tighter bins or pruned cell searches | Moderate to large | May further reduce pair-loop work; the 3D particle candidate cache above already trades memory for fewer checks |
 | Thread-count and batch-size tuning | Low | Measure representative sizes; more threads can add overhead for small cases |
 | SIMD blocks or evaluating pair geometry once for both particles | Large | Requires careful accumulation, thread ownership, and model-specific physics checks |
 
@@ -233,11 +271,25 @@ timestamp; exact-time output would require interpolation.
 VTKHDF writes run in one persistent `Threads.@spawn` writer task while the solver
 continues on the other Julia threads. Launch with at least two threads (for
 example, `julia --threads=auto`) to overlap blocking HDF5 work with simulation.
+The transient writer keeps its HDF5 group and dataset handles open across frames,
+uses larger grid chunks, and obtains each grid frame's cell offset from the
+existing extent instead of reading the full history. The output timer now includes
+progress logging and the time spent waiting for a free snapshot buffer.
 Particle snapshots use a bounded two-buffer pool: if storage cannot sustain the
 requested output rate, the solver waits instead of dropping frames or allowing
 memory use to grow without bound. Finalization always waits for queued writes to
 finish, so reducing output frequency still reduces total data-copying and HDF5
 work.
+
+For the four-second StillWedge example with particle and grid output on local
+storage, 32 default threads, and three warmed runs per interval, `OutputTimes=0.01`
+produced 401 frames and took 2.17 s median; `0.1` produced 41 frames and took
+2.02 s. Before the writer changes these were 2.28 s and 2.05 s. Both intervals
+produced identical timesteps and final particle fields. The first measured run
+included compilation and took about 15 s at `0.01` in both versions. Disk and
+console speed can change the size of the remaining output cost. The two VTKHDF
+files total about 201 MB at `0.01` versus 21 MB at `0.1`, so storage throughput
+still matters when asking for ten times as many frames.
 
 ## Help
 

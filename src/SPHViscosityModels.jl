@@ -82,7 +82,7 @@ end
     ρᵢ  = SimParticles.Density[i]
     ρⱼ  = SimParticles.Density[j]
 
-    term = (4 * m₀ * ν₀ * dot(xᵢⱼ, ∇ᵢWᵢⱼ)) / ((ρᵢ + ρⱼ) + (d² + η²))
+    term = (4 * m₀ * ν₀ * dot(xᵢⱼ, ∇ᵢWᵢⱼ)) / ((ρᵢ + ρⱼ) * (d² + η²))
     return term * vᵢⱼ, -term * vᵢⱼ
 end
 

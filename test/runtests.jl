@@ -2,6 +2,24 @@ using Test
 using SPHExample
 using StaticArrays
 using StructArrays
+using LinearAlgebra
+
+@testset "laminar viscosity" begin
+    T = Float64
+    sc = SimulationConstants{T}(m₀=2, ν₀=0.3)
+    ker = SPHKernelInstance{2,T}(WendlandC2(); dx=sc.dx)
+    particles = (Density = T[1000, 1200],)
+    x = SVector{2,T}(0.5, 0)
+    v = SVector{2,T}(1, 2)
+    grad = SVector{2,T}(-3, 0)
+    d² = sum(abs2, x)
+    force, reaction = compute_viscosity(Laminar(), ker, sc, particles,
+                                        x, v, grad, d², 1, 2)
+    factor = (4 * sc.m₀ * sc.ν₀ * dot(x, grad)) /
+             ((particles.Density[1] + particles.Density[2]) * (d² + ker.η²))
+    @test force ≈ factor * v
+    @test reaction == -force
+end
 
 @testset "time stepping" begin
     pos = [SVector{2,Float64}(0.0, 0.0), SVector{2,Float64}(1.0, 0.0)]

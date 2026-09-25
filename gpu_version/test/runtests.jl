@@ -90,6 +90,12 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
 
     @testset "counting sort orders particles by cell" begin
         case = BENCH_CASES[findfirst(c -> c.name == "StillWedge2D_MDBC_dp0.02", BENCH_CASES)]
+        initial = AllocateDataStructures(case.build(Float64, mktempdir()).SimGeometry)
+        device = upload_particles(initial)
+        @test !hasproperty(device, :GravityFactor)
+        @test !hasproperty(device, :MotionLimiter)
+        @test !hasproperty(device.scratch, :GravityFactor)
+        @test !hasproperty(device.scratch, :MotionLimiter)
         particles, meta = run_gpu(case, Float64, 1e-4)
         # after the run the host arrays are the (cell sorted) device state; the
         # sort above restored ID order, so check on a fresh download instead

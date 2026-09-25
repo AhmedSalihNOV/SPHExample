@@ -2,6 +2,7 @@ module SPHDensityDiffusionModels
 
 using StaticArrays, LinearAlgebra
 using ..SimulationEquations
+using ..SimulationGeometry: MotionLimiterValue
 #---------------------------------------------------------------
 # Exported
 #---------------------------------------------------------------
@@ -38,8 +39,7 @@ struct ZeroDensityDiffusion <: SPHDensityDiffusion end
         ∇ᵢWᵢⱼ,
         d²,
         i,
-        j,
-        MotionLimiter
+        j
 )
         return zero(d²), zero(d²)
 end
@@ -62,8 +62,7 @@ struct ZeroGravityLinearDensityDiffusion <: SPHDensityDiffusion end
         ∇ᵢWᵢⱼ,
         d²,
         i,
-        j,
-        MotionLimiter
+        j
 )
 
         (; ρ₀, m₀, c₀, δᵩ, Cb, Cb⁻¹, γ) = SimConstants
@@ -106,8 +105,7 @@ struct LinearDensityDiffusion <: SPHDensityDiffusion end
         ∇ᵢWᵢⱼ,
         d²,
         i,
-        j,
-        MotionLimiter
+        j
 )
 
         (; ρ₀, m₀, c₀, δᵩ, Cb, Cb⁻¹, γ, g) = SimConstants
@@ -127,7 +125,8 @@ struct LinearDensityDiffusion <: SPHDensityDiffusion end
         ρⱼᵢ = ρⱼ - ρᵢ
         ψᵢⱼ = 2 * (ρⱼᵢ - ρᵢⱼᴴ)  * (-xᵢⱼ) * invdᵢⱼ²η²
 
-        MLcond = MotionLimiter[i] * MotionLimiter[j]
+        MLcond = MotionLimiterValue(typeof(ρᵢ), SimParticles.Type[i]) *
+                 MotionLimiterValue(typeof(ρᵢ), SimParticles.Type[j])
 
         Dᵢ  = δᵩ * h * c₀ * (m₀/ρⱼ) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ) * MLcond
         Dⱼ  = -Dᵢ
@@ -156,8 +155,7 @@ struct ComplexDensityDiffusion <: SPHDensityDiffusion end
         ∇ᵢWᵢⱼ,
         d²,
         i,
-        j,
-        MotionLimiter
+        j
 )
 
         (; ρ₀, m₀, c₀, δᵩ, Cb, Cb⁻¹, γ, g) = SimConstants
@@ -179,7 +177,8 @@ struct ComplexDensityDiffusion <: SPHDensityDiffusion end
         ρⱼᵢ = ρⱼ - ρᵢ
         ψᵢⱼ = 2 * (ρⱼᵢ - ρᵢⱼᴴ)  * (-xᵢⱼ) * invdᵢⱼ²η²
 
-        MLcond = MotionLimiter[i] * MotionLimiter[j]
+        MLcond = MotionLimiterValue(typeof(ρᵢ), SimParticles.Type[i]) *
+                 MotionLimiterValue(typeof(ρᵢ), SimParticles.Type[j])
 
         Dᵢ  = δᵩ * h * c₀ * (m₀/ρⱼ) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ) * MLcond
         Dⱼ  = -Dᵢ

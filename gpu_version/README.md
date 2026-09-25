@@ -68,7 +68,8 @@ the standard *gather* formulation:
   27 cells. The reorder is followed by an in-cell insertion sort, which makes
   runs bitwise reproducible (`GPUDeterministicSort = false` skips it). The
   cell list is only rebuilt when the accumulated displacement exceeds `h`,
-  exactly like the CPU version.
+  exactly like the CPU version. Gravity and motion factors are derived from
+  particle type instead of stored or reordered as separate arrays.
 * **Fused element-wise kernels.** Half step, density limiting, prescribed
   motion and pressure are one kernel; the final step also computes the
   pressure for the next step and the block wise reduction of the time step
@@ -176,4 +177,3 @@ Notes on reading the table:
   in 2D, 10x at 366k in 3D) because large launches amortize the fixed
   per-kernel overhead (~16 µs on Windows/WDDM); a desktop GPU with more SMs
   will extend this trend to even larger cases.
-

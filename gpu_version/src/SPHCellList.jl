@@ -53,8 +53,6 @@ mutable struct GPUParticles{D, T, S}
     Position::CuVector{SVector{D, T}}
     Velocity::CuVector{SVector{D, T}}
     Density::CuVector{T}
-    GravityFactor::CuVector{T}
-    MotionLimiter::CuVector{T}
     BoundaryBool::CuVector{UInt8}
     ID::CuVector{Int}
     Type::CuVector{ParticleType}
@@ -74,14 +72,14 @@ end
 
 Base.length(p::GPUParticles) = length(p.Position)
 
-const PERSISTENT_FIELDS = (:Position, :Velocity, :Density, :GravityFactor, :MotionLimiter,
+const PERSISTENT_FIELDS = (:Position, :Velocity, :Density,
                            :BoundaryBool, :ID, :Type, :GroupMarker, :GhostPoints, :GhostNormals,
                            :Acceleration, :Pressure)
 
 """
     upload_particles(SimParticles::StructArray) -> GPUParticles
 
-Copy every field of the host particle array to the GPU.
+Copy every stored field of the host particle array to the GPU.
 """
 function upload_particles(SimParticles::StructArray)
     Position = CuArray(SimParticles.Position)
@@ -93,8 +91,6 @@ function upload_particles(SimParticles::StructArray)
         Position      = similar(Position),
         Velocity      = CuVector{SVector{D, T}}(undef, n),
         Density       = CuVector{T}(undef, n),
-        GravityFactor = CuVector{T}(undef, n),
-        MotionLimiter = CuVector{T}(undef, n),
         BoundaryBool  = CuVector{UInt8}(undef, n),
         ID            = CuVector{Int}(undef, n),
         Type          = CuVector{ParticleType}(undef, n),
@@ -109,8 +105,6 @@ function upload_particles(SimParticles::StructArray)
         Position,
         CuArray(SimParticles.Velocity),
         CuArray(SimParticles.Density),
-        CuArray(SimParticles.GravityFactor),
-        CuArray(SimParticles.MotionLimiter),
         CuArray(SimParticles.BoundaryBool),
         CuArray(SimParticles.ID),
         CuArray(SimParticles.Type),
@@ -137,8 +131,6 @@ function download_particles!(SimParticles::StructArray, gpu::GPUParticles{D, T},
     copyto!(SimParticles.Position,       gpu.Position)
     copyto!(SimParticles.Velocity,       gpu.Velocity)
     copyto!(SimParticles.Density,        gpu.Density)
-    copyto!(SimParticles.GravityFactor,  gpu.GravityFactor)
-    copyto!(SimParticles.MotionLimiter,  gpu.MotionLimiter)
     copyto!(SimParticles.BoundaryBool,   gpu.BoundaryBool)
     copyto!(SimParticles.ID,             gpu.ID)
     copyto!(SimParticles.Type,           gpu.Type)
@@ -218,10 +210,10 @@ end
 
 function rebuild_cell_list!(gpu::GPUParticles, cl::CellListWorkspace, InverseCutOff)
     s = gpu.scratch
-    srcs = (gpu.Position, gpu.Velocity, gpu.Density, gpu.GravityFactor, gpu.MotionLimiter,
+    srcs = (gpu.Position, gpu.Velocity, gpu.Density,
             gpu.BoundaryBool, gpu.ID, gpu.Type, gpu.GroupMarker, gpu.GhostPoints, gpu.GhostNormals,
             gpu.Acceleration, gpu.Pressure, cl.CellIDScratch)
-    dsts = (s.Position, s.Velocity, s.Density, s.GravityFactor, s.MotionLimiter,
+    dsts = (s.Position, s.Velocity, s.Density,
             s.BoundaryBool, s.ID, s.Type, s.GroupMarker, s.GhostPoints, s.GhostNormals,
             s.Acceleration, s.Pressure, gpu.CellID)
 
@@ -230,7 +222,6 @@ function rebuild_cell_list!(gpu::GPUParticles, cl::CellListWorkspace, InverseCut
     # Swap the two sets of persistent arrays.
     gpu.scratch = (
         Position = gpu.Position, Velocity = gpu.Velocity, Density = gpu.Density,
-        GravityFactor = gpu.GravityFactor, MotionLimiter = gpu.MotionLimiter,
         BoundaryBool = gpu.BoundaryBool, ID = gpu.ID, Type = gpu.Type,
         GroupMarker = gpu.GroupMarker, GhostPoints = gpu.GhostPoints, GhostNormals = gpu.GhostNormals,
         Acceleration = gpu.Acceleration, Pressure = gpu.Pressure,
@@ -238,8 +229,6 @@ function rebuild_cell_list!(gpu::GPUParticles, cl::CellListWorkspace, InverseCut
     gpu.Position      = s.Position
     gpu.Velocity      = s.Velocity
     gpu.Density       = s.Density
-    gpu.GravityFactor = s.GravityFactor
-    gpu.MotionLimiter = s.MotionLimiter
     gpu.BoundaryBool  = s.BoundaryBool
     gpu.ID            = s.ID
     gpu.Type          = s.Type
@@ -348,7 +337,7 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
         CellStart = cl.CellStart
         # Arrays read by the viscosity and density diffusion models (same
         # convention as the CPU code: always the state at the start of the step)
-        SimParticlesNT = (Density = gpu.Density, Velocity = gpu.Velocity)
+        SimParticlesNT = (Density = gpu.Density, Velocity = gpu.Velocity, Type = gpu.Type)
 
         # The pressure of the start-of-step density was already computed by the
         # final kernel of the previous step (and on the host before the first).
@@ -372,7 +361,7 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
             @timeit HourGlass "04 First NeighborLoop" begin
                 launch_interactions!(sup.dρdtI, gpu.Acceleration, gpu.Kernel, gpu.KernelGradient, sup.∇Cᵢ, sup.∇◌rᵢ,
                                      gpu.ChunkID, gpu.Position, gpu.Density, gpu.Pressure, gpu.Velocity,
-                                     gpu.MotionLimiter, SimParticlesNT, CellStart, gpu.CellID, grid,
+                                     gpu.Type, SimParticlesNT, CellStart, gpu.CellID, grid,
                                      SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                                      FlagKernel, FlagShift; threads = threads, lanes = lanes,
                                      boundary_forces = bforces)
@@ -383,7 +372,7 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
         @timeit HourGlass "05b Update To Half TimeStep" begin
             launch_half_step!(sup.Positionₙ⁺, sup.Velocityₙ⁺, sup.ρₙ⁺, gpu.Pressure,
                               gpu.Position, gpu.Velocity, gpu.Acceleration, gpu.Density, sup.dρdtI,
-                              gpu.GravityFactor, gpu.MotionLimiter, gpu.Type, gpu.GroupMarker, motion,
+                              gpu.Type, gpu.GroupMarker, motion,
                               dt₂, SimMetaData.TotalTime, SimConstants)
             maybe_sync(SimMetaData)
         end
@@ -391,7 +380,7 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
         @timeit HourGlass "08 Second NeighborLoop" begin
             launch_interactions!(sup.dρdtI, gpu.Acceleration, gpu.Kernel, gpu.KernelGradient, sup.∇Cᵢ, sup.∇◌rᵢ,
                                  gpu.ChunkID, sup.Positionₙ⁺, sup.ρₙ⁺, gpu.Pressure, sup.Velocityₙ⁺,
-                                 gpu.MotionLimiter, SimParticlesNT, CellStart, gpu.CellID, grid,
+                                 gpu.Type, SimParticlesNT, CellStart, gpu.CellID, grid,
                                  SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                                  FlagKernel, FlagShift; threads = threads, lanes = lanes,
                                  boundary_forces = bforces)
@@ -400,7 +389,7 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
 
         @timeit HourGlass "11 Update To Final TimeStep" begin
             launch_final_step!(gpu.Position, gpu.Velocity, gpu.Acceleration, gpu.Density, gpu.Pressure,
-                               sup.dρdtI, sup.ρₙ⁺, sup.Positionₙ⁺, gpu.GravityFactor, gpu.MotionLimiter,
+                               sup.dρdtI, sup.ρₙ⁺, sup.Positionₙ⁺, gpu.Type,
                                sup.∇Cᵢ, sup.∇◌rᵢ, dt, SimKernel, SimConstants, red, FlagShift)
             maybe_sync(SimMetaData)
         end

@@ -51,6 +51,16 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
 @testset "SPHExampleGPU" begin
     @test CUDA.functional()
 
+    @testset "type-derived factors" begin
+        for T in (Float32, Float64)
+            for (type, gravity, limiter) in ((Fluid, -1, 1), (Fixed, 0, 0),
+                                              (Moving, 1, 0))
+                @test GravityFactorValue(T, type) === T(gravity)
+                @test MotionLimiterValue(T, type) === T(limiter)
+            end
+        end
+    end
+
     @testset "cell grid helpers" begin
         invH = 1 / 0.04
         @test map_floor(0.0, invH)   == 0
@@ -85,6 +95,9 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
         # sort above restored ID order, so check on a fresh download instead
         @test length(unique(particles.ID)) == length(particles)
         @test all(isfinite, particles.Density)
+        @test !hasproperty(particles, :GravityFactor)
+        @test !hasproperty(particles, :MotionLimiter)
+        @test particles.BoundaryBool == UInt8.(particles.Type .!= Fluid)
     end
 
     @testset "deterministic repeat" begin

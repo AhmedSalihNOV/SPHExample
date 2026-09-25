@@ -127,7 +127,7 @@ end
 #---------------------------------------------------------------
 
 function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ, ChunkID,
-                             Position, Density, Pressure, Velocity, MotionLimiter, SimParticles,
+                             Position, Density, Pressure, Velocity, ParticleType, SimParticles,
                              CellStart, CellID, grid::CellGrid{D},
                              SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                              ::Val{FlagKernel}, ::Val{FlagShift}, ::Val{BoundaryForces}, ::Val{K},
@@ -153,7 +153,7 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
         vᵢ  = Velocity[i]
         ρᵢ  = Density[i]
         Pᵢ  = Pressure[i]
-        MLᵢ = MotionLimiter[i]
+        MLᵢ = MotionLimiterValue(T, ParticleType[i])
 
         # Boundary particles only need the density rate; their acceleration is
         # never applied (MotionLimiter = 0). Skipping the momentum terms for them
@@ -194,8 +194,7 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
                         ia  = i_first ? i : j
                         ja  = i_first ? j : i
                         D1, D2 = compute_density_diffusion(SimDensityDiffusion, SimKernel, SimConstants,
-                                                           SimParticles, sgn * xᵢⱼ, sgn * ∇ᵢWᵢⱼ, xᵢⱼ², ia, ja,
-                                                           MotionLimiter)
+                                                           SimParticles, sgn * xᵢⱼ, sgn * ∇ᵢWᵢⱼ, xᵢⱼ², ia, ja)
                         dρdt += i_first ? D1 : D2
 
                         if forces
@@ -216,7 +215,7 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
                         end
 
                         if FlagShift
-                            MLcond = MLᵢ * MotionLimiter[j]
+                            MLcond = MLᵢ * MotionLimiterValue(T, ParticleType[j])
                             ∇C += (m₀ / ρᵢ) * ∇ᵢWᵢⱼ
                             # Sign convention follows the CPU code, see
                             # https://arxiv.org/abs/2110.10076
@@ -270,7 +269,7 @@ the CPU code. `lanes` is the number of warp lanes per particle (`Val`). With
 with `MotionLimiter == 0`.
 """
 function launch_interactions!(dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ, ChunkID,
-                              Position, Density, Pressure, Velocity, MotionLimiter, SimParticles,
+                              Position, Density, Pressure, Velocity, ParticleType, SimParticles,
                               CellStart, CellID, grid,
                               SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                               FlagKernel::Val, FlagShift::Val; threads::Integer = 128, lanes::Val = Val(1),
@@ -280,7 +279,7 @@ function launch_interactions!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C
     K = typeof(lanes).parameters[1]
     @cuda threads=threads blocks=cld(n * K, threads) interaction_kernel!(
         dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ, ChunkID,
-        Position, Density, Pressure, Velocity, MotionLimiter, SimParticles,
+        Position, Density, Pressure, Velocity, ParticleType, SimParticles,
         CellStart, CellID, grid,
         SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
         FlagKernel, FlagShift, boundary_forces, lanes, Int32(n))
@@ -436,15 +435,17 @@ end
 #---------------------------------------------------------------
 
 function half_step_kernel!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, Pressure,
-                           Position, Velocity, Acceleration, Density, dρdtI, GravityFactor, MotionLimiter,
+                           Position, Velocity, Acceleration, Density, dρdtI,
                            ParticleType, GroupMarker, motion, dt₂, TotalTime, SimConstants, n::Int32)
     i = thread_index()
     i > n && return nothing
     (; g, ρ₀, c₀) = SimConstants
+    T = eltype(Density)
     @inbounds begin
-        ML  = MotionLimiter[i]
+        type = ParticleType[i]
+        ML  = MotionLimiterValue(T, type)
         acc = Acceleration[i]
-        acc += ConstructGravitySVector(acc, g * GravityFactor[i])
+        acc += ConstructGravitySVector(acc, g * GravityFactorValue(T, type))
         Acceleration[i] = acc
         Positionₙ⁺[i]   = Position[i] + Velocity[i] * dt₂ * ML
         Velocityₙ⁺[i]   = Velocity[i] + acc * dt₂ * ML
@@ -460,13 +461,13 @@ function half_step_kernel!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, Pressure,
 end
 
 function launch_half_step!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, Pressure,
-                           Position, Velocity, Acceleration, Density, dρdtI, GravityFactor, MotionLimiter,
+                           Position, Velocity, Acceleration, Density, dρdtI,
                            ParticleType, GroupMarker, motion, dt₂, TotalTime, SimConstants)
     n = length(Position)
     n == 0 && return nothing
     @cuda threads=ELEMENTWISE_THREADS blocks=cld(n, ELEMENTWISE_THREADS) half_step_kernel!(
         Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, Pressure,
-        Position, Velocity, Acceleration, Density, dρdtI, GravityFactor, MotionLimiter,
+        Position, Velocity, Acceleration, Density, dρdtI,
         ParticleType, GroupMarker, motion, dt₂, TotalTime, SimConstants, Int32(n))
     return nothing
 end
@@ -503,7 +504,7 @@ end
     SVector{3, T}(max(a[1], b[1]), min(a[2], b[2]), max(a[3], b[3]))
 
 function final_step_kernel!(Position, Velocity, Acceleration, Density, Pressure, dρdtI, ρₙ⁺, Positionₙ⁺,
-                            GravityFactor, MotionLimiter, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
+                            ParticleType, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
                             partial, ::Val{FlagShift}, n::Int32) where {FlagShift}
     (; g, ρ₀, c₀) = SimConstants
     T = eltype(Density)
@@ -512,7 +513,8 @@ function final_step_kernel!(Position, Velocity, Acceleration, Density, Pressure,
     i = thread_index()
     stride = blockDim().x * gridDim().x
     @inbounds while i <= n
-        ML = MotionLimiter[i]
+        type = ParticleType[i]
+        ML = MotionLimiterValue(T, type)
 
         # LimitDensityAtBoundary! followed by DensityEpsi!
         ρ    = limit_density(Density[i], ρ₀, ML)
@@ -523,7 +525,7 @@ function final_step_kernel!(Position, Velocity, Acceleration, Density, Pressure,
 
         # FullTimeStep
         acc = Acceleration[i]
-        acc += ConstructGravitySVector(acc, g * GravityFactor[i])
+        acc += ConstructGravitySVector(acc, g * GravityFactorValue(T, type))
         Acceleration[i] = acc
         v_old = Velocity[i]
         v     = v_old + acc * dt * ML
@@ -559,13 +561,13 @@ per block reduction results fit the reduction workspace; finish the
 reduction with `finish_reduction(red, step_reduce, init)`.
 """
 function launch_final_step!(Position, Velocity, Acceleration, Density, Pressure, dρdtI, ρₙ⁺, Positionₙ⁺,
-                            GravityFactor, MotionLimiter, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
+                            ParticleType, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
                             red::ReductionWorkspace, FlagShift::Val)
     n = length(Position)
     n == 0 && return nothing
     @cuda threads=ELEMENTWISE_THREADS blocks=red.nblocks final_step_kernel!(
         Position, Velocity, Acceleration, Density, Pressure, dρdtI, ρₙ⁺, Positionₙ⁺,
-        GravityFactor, MotionLimiter, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
+        ParticleType, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
         red.partial, FlagShift, Int32(n))
     return nothing
 end

@@ -77,29 +77,7 @@ function AllocateDataStructures(SimGeometry::Vector{<:Geometry{Dimensions, Float
     PositionType             = eltype(Position)
     PositionUnderlyingType   = eltype(PositionType)
 
-    GravityFactor = similar(Density)
-    for i ∈ eachindex(GravityFactor)
-        fac = 0
-        if     Types[i] == Fluid
-            fac = -1
-        elseif Types[i] == Moving
-            fac =  1
-        end
-        GravityFactor[i] = fac
-    end
-
-    MotionLimiter = similar(Density)
-    for i ∈ eachindex(MotionLimiter)
-        fac = 0
-        if   Types[i] == Fluid
-            fac =  1
-        else Types[i] == Moving
-            fac =  0
-        end
-        MotionLimiter[i] = fac
-    end
-
-    BoundaryBool  = UInt8.(.!Bool.(MotionLimiter))
+    BoundaryBool  = UInt8.(Types .!= Fluid)
 
     Acceleration    = zeros(PositionType, NumberOfPoints)
     Velocity        = zeros(PositionType, NumberOfPoints)
@@ -113,7 +91,7 @@ function AllocateDataStructures(SimGeometry::Vector{<:Geometry{Dimensions, Float
     Cells          = fill(zero(CartesianIndex{Dimensions}), NumberOfPoints)
     ChunkID        = zeros(Int, NumberOfPoints)
 
-    SimParticles = StructArray((Cells = Cells, ChunkID = ChunkID, Kernel = Kernel, KernelGradient = KernelGradient, Position=Position, Acceleration=Acceleration, Velocity=Velocity, Density=Density, Pressure=Pressureᵢ, GravityFactor=GravityFactor, MotionLimiter=MotionLimiter, BoundaryBool = BoundaryBool, ID = Idp , Type = Types, GroupMarker = GroupMarker, GhostPoints = GhostPoints, GhostNormals=GhostNormals))
+    SimParticles = StructArray((Cells = Cells, ChunkID = ChunkID, Kernel = Kernel, KernelGradient = KernelGradient, Position=Position, Acceleration=Acceleration, Velocity=Velocity, Density=Density, Pressure=Pressureᵢ, BoundaryBool = BoundaryBool, ID = Idp , Type = Types, GroupMarker = GroupMarker, GhostPoints = GhostPoints, GhostNormals=GhostNormals))
 
     sort!(SimParticles, by = p -> p.ID)
 
@@ -166,4 +144,3 @@ function LoadBoundaryNormals(::Val{D}, ::Type{T}, path_mdbc) where {D, T}
 end
 
 end
-

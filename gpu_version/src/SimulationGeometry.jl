@@ -4,7 +4,8 @@ using StaticArrays
 using Base: @kwdef
 
 # Export relevant types and structs
-export ParticleType, Geometry, Fluid, Fixed, Moving, MotionDetails
+export ParticleType, Geometry, Fluid, Fixed, Moving, MotionDetails,
+       GravityFactorValue, MotionLimiterValue
 
 # Use the existing @enum for ParticleType
 @enum ParticleType::UInt8 begin
@@ -12,6 +13,12 @@ export ParticleType, Geometry, Fluid, Fixed, Moving, MotionDetails
     Fixed  = UInt8(2)
     Moving = UInt8(3)
 end
+
+@inline GravityFactorValue(::Type{T}, type::ParticleType) where {T} =
+    type == Fluid ? -one(T) : (type == Moving ? one(T) : zero(T))
+
+@inline MotionLimiterValue(::Type{T}, type::ParticleType) where {T} =
+    type == Fluid ? one(T) : zero(T)
 
 # Define a struct to store motion details, with parametric dimensions and floating point type
 @kwdef struct MotionDetails{D, T}

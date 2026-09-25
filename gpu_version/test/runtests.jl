@@ -8,7 +8,10 @@ using HDF5
 
 include(joinpath(@__DIR__, "..", "benchmark", "cases.jl"))
 
-const REPO      = normpath(joinpath(@__DIR__, "..", ".."))
+# Project of the CPU package used as the reference. Defaults to the repository
+# containing `gpu_version`; set `SPHEXAMPLE_CPU_REF` to compare against another
+# checkout (e.g. a branch of the CPU code).
+const REPO      = normpath(get(ENV, "SPHEXAMPLE_CPU_REF", joinpath(@__DIR__, "..", "..")))
 const CPU_REF   = joinpath(@__DIR__, "cpu_reference.jl")
 const HAVE_CPU  = isfile(joinpath(REPO, "src", "SPHExample.jl"))
 
@@ -123,6 +126,41 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
             @test all(x -> all(isfinite, x), p.Position)
             @test 900 < minimum(p.Density) && maximum(p.Density) < 1100
         end
+    end
+
+    @testset "models use the densities passed by the kernel" begin
+        # The kernel hands the models ρᵢ, ρⱼ and their reciprocals of the state
+        # being evaluated. The built in models must not reach back into a
+        # particle array (which in the corrector loop would hold the wrong
+        # state), so `SimParticles = nothing` has to work.
+        T  = Float64
+        consts = SimulationConstants{T}(dx = 0.02, c₀ = 42.0, δᵩ = 0.1, α = 0.02, ν₀ = 1e-4)
+        kern   = SPHKernelInstance{2, T}(WendlandC2(); dx = consts.dx)
+        xᵢⱼ    = SVector{2, T}(0.011, -0.007)
+        vᵢⱼ    = SVector{2, T}(0.3, 0.1)
+        d²     = dot(xᵢⱼ, xᵢⱼ)
+        ∇W     = ∇Wᵢⱼ(kern, sqrt(d²) * kern.h⁻¹, xᵢⱼ)
+        ρᵢ, ρⱼ = T(1003.5), T(998.2)
+        types  = [Fluid, Fluid]
+        for model in (ZeroViscosity(), ArtificialViscosity(), Laminar(), LaminarSPS())
+            Πᵢ, Πⱼ = compute_viscosity(model, kern, consts, nothing, xᵢⱼ, vᵢⱼ, ∇W, d²,
+                                       ρᵢ, ρⱼ, inv(ρᵢ), inv(ρⱼ), 1, 2)
+            @test all(isfinite, Πᵢ) && all(isfinite, Πⱼ)
+            @test Πⱼ ≈ -Πᵢ
+        end
+        for model in (ZeroDensityDiffusion(), ZeroGravityLinearDensityDiffusion(),
+                      LinearDensityDiffusion(), ComplexDensityDiffusion())
+            Dᵢ, Dⱼ = compute_density_diffusion(model, kern, consts, nothing, xᵢⱼ, ∇W, d²,
+                                               ρᵢ, ρⱼ, inv(ρᵢ), inv(ρⱼ), 1, 2, types)
+            @test isfinite(Dᵢ) && Dⱼ == -Dᵢ
+        end
+        # Laminar viscosity is antisymmetric in the density arguments and
+        # depends on them, so passing different densities must change it.
+        a, _ = compute_viscosity(Laminar(), kern, consts, nothing, xᵢⱼ, vᵢⱼ, ∇W, d²,
+                                 ρᵢ, ρⱼ, inv(ρᵢ), inv(ρⱼ), 1, 2)
+        b, _ = compute_viscosity(Laminar(), kern, consts, nothing, xᵢⱼ, vᵢⱼ, ∇W, d²,
+                                 2ρᵢ, 2ρⱼ, inv(2ρᵢ), inv(2ρⱼ), 1, 2)
+        @test a ≈ 2b
     end
 
     if HAVE_CPU

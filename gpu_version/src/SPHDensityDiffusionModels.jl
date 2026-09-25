@@ -20,6 +20,22 @@ export  SPHDensityDiffusion,
 #---------------------------------------------------------------
 abstract type SPHDensityDiffusion end
 
+"""
+    compute_density_diffusion(model, SimKernel, SimConstants, SimParticles,
+                              xᵢⱼ, ∇ᵢWᵢⱼ, d², ρᵢ, ρⱼ, ρᵢ⁻¹, ρⱼ⁻¹, i, j, ParticleType)
+
+Density diffusion contribution of the pair `(i, j)` for the selected `model`.
+Returns `(Dᵢ, Dⱼ)`.
+
+The interaction kernel supplies the densities of the state being evaluated
+(the predictor density during the corrector loop) and their precomputed
+reciprocals, so models neither reload nor divide by density. Same signature
+as the CPU package. `SimParticles` is a NamedTuple of the evaluated state's
+device arrays for custom models; the built in models only read
+`ParticleType`.
+"""
+function compute_density_diffusion end
+
 #---------------------------------------------------------------
 # 1) ZeroDensityDiffusion(): ignore all diffusion
 #---------------------------------------------------------------
@@ -38,8 +54,13 @@ struct ZeroDensityDiffusion <: SPHDensityDiffusion end
         xᵢⱼ,
         ∇ᵢWᵢⱼ,
         d²,
+        ρᵢ,
+        ρⱼ,
+        ρᵢ⁻¹,
+        ρⱼ⁻¹,
         i,
-        j
+        j,
+        ParticleType
 )
         return zero(d²), zero(d²)
 end
@@ -61,15 +82,17 @@ struct ZeroGravityLinearDensityDiffusion <: SPHDensityDiffusion end
         xᵢⱼ,
         ∇ᵢWᵢⱼ,
         d²,
+        ρᵢ,
+        ρⱼ,
+        ρᵢ⁻¹,
+        ρⱼ⁻¹,
         i,
-        j
+        j,
+        ParticleType
 )
 
         (; ρ₀, m₀, c₀, δᵩ, Cb, Cb⁻¹, γ) = SimConstants
         (; h, η²) = SimKernel
-
-        ρᵢ  = SimParticles.Density[i]
-        ρⱼ  = SimParticles.Density[j]
 
         # g == 0 => skip any hydrostatic parts
         
@@ -78,8 +101,9 @@ struct ZeroGravityLinearDensityDiffusion <: SPHDensityDiffusion end
         ρⱼᵢ = ρⱼ - ρᵢ
         ψᵢⱼ = 2 * ρⱼᵢ * (-xᵢⱼ) * invdᵢⱼ²η²
 
-        Dᵢ  = δᵩ * h * c₀ * (m₀/ρⱼ) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ)
-        Dⱼ  = -Dᵢ
+        ψ∇W = dot(ψᵢⱼ, ∇ᵢWᵢⱼ)  # TEMP-BRANCH-DJ
+        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * ψ∇W
+        Dⱼ  = δᵩ * h * c₀ * (m₀ * ρᵢ⁻¹) * -ψ∇W
 
 
         return Dᵢ, Dⱼ
@@ -104,17 +128,19 @@ struct LinearDensityDiffusion <: SPHDensityDiffusion end
         xᵢⱼ,
         ∇ᵢWᵢⱼ,
         d²,
+        ρᵢ,
+        ρⱼ,
+        ρᵢ⁻¹,
+        ρⱼ⁻¹,
         i,
-        j
+        j,
+        ParticleType
 )
 
         (; ρ₀, m₀, c₀, δᵩ, Cb, Cb⁻¹, γ, g) = SimConstants
         (; h, η²) = SimKernel
 
         Linear_ρ_factor = (1/(Cb*γ))*ρ₀
-
-        ρᵢ  = SimParticles.Density[i]
-        ρⱼ  = SimParticles.Density[j]
 
         Pᵢⱼᴴ  = ρ₀ * (-g) * -xᵢⱼ[end]
         ρᵢⱼᴴ  = Pᵢⱼᴴ * Linear_ρ_factor
@@ -125,11 +151,12 @@ struct LinearDensityDiffusion <: SPHDensityDiffusion end
         ρⱼᵢ = ρⱼ - ρᵢ
         ψᵢⱼ = 2 * (ρⱼᵢ - ρᵢⱼᴴ)  * (-xᵢⱼ) * invdᵢⱼ²η²
 
-        MLcond = MotionLimiterValue(typeof(ρᵢ), SimParticles.Type[i]) *
-                 MotionLimiterValue(typeof(ρᵢ), SimParticles.Type[j])
+        MLcond = MotionLimiterValue(typeof(ρᵢ), ParticleType[i]) *
+                 MotionLimiterValue(typeof(ρᵢ), ParticleType[j])
 
-        Dᵢ  = δᵩ * h * c₀ * (m₀/ρⱼ) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ) * MLcond
-        Dⱼ  = -Dᵢ
+        ψ∇W = dot(ψᵢⱼ, ∇ᵢWᵢⱼ)  # TEMP-BRANCH-DJ
+        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * ψ∇W * MLcond
+        Dⱼ  = δᵩ * h * c₀ * (m₀ * ρᵢ⁻¹) * -ψ∇W * MLcond
 
         return Dᵢ, Dⱼ
 end
@@ -154,15 +181,17 @@ struct ComplexDensityDiffusion <: SPHDensityDiffusion end
         xᵢⱼ,
         ∇ᵢWᵢⱼ,
         d²,
+        ρᵢ,
+        ρⱼ,
+        ρᵢ⁻¹,
+        ρⱼ⁻¹,
         i,
-        j
+        j,
+        ParticleType
 )
 
         (; ρ₀, m₀, c₀, δᵩ, Cb, Cb⁻¹, γ, g) = SimConstants
         (; h, η²) = SimKernel
-
-        ρᵢ  = SimParticles.Density[i]
-        ρⱼ  = SimParticles.Density[j]
 
         # In theory these two equations are not completely symmetric.
         # In practice it is 'good' enough and saves a lot of time to
@@ -177,10 +206,10 @@ struct ComplexDensityDiffusion <: SPHDensityDiffusion end
         ρⱼᵢ = ρⱼ - ρᵢ
         ψᵢⱼ = 2 * (ρⱼᵢ - ρᵢⱼᴴ)  * (-xᵢⱼ) * invdᵢⱼ²η²
 
-        MLcond = MotionLimiterValue(typeof(ρᵢ), SimParticles.Type[i]) *
-                 MotionLimiterValue(typeof(ρᵢ), SimParticles.Type[j])
+        MLcond = MotionLimiterValue(typeof(ρᵢ), ParticleType[i]) *
+                 MotionLimiterValue(typeof(ρᵢ), ParticleType[j])
 
-        Dᵢ  = δᵩ * h * c₀ * (m₀/ρⱼ) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ) * MLcond
+        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ) * MLcond
         Dⱼ  = -Dᵢ
 
         return Dᵢ, Dⱼ

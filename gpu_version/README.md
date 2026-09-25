@@ -54,12 +54,15 @@ the standard *gather* formulation:
   `K`-th candidate) and the partial sums are merged with warp shuffles, so a
   3 000 particle 2D case still keeps the whole GPU busy.
 * **Exact CPU semantics.** The CPU's density diffusion uses `Dⱼ = -Dᵢ` as a
-  short cut that is not symmetric in the particle roles, and the models read
-  the start-of-step density and velocity rather than the half step values.
-  The gather kernel reconstructs which particle of a pair was the CPU's `i`
-  (lower index inside a cell, higher index across cells) and calls the very
-  same `compute_viscosity`/`compute_density_diffusion` functions, so the GPU
-  reproduces the CPU results instead of a "close" variant.
+  short cut that is not symmetric in the particle roles. The gather kernel
+  reconstructs which particle of a pair was the CPU's `i` (lower index inside
+  a cell, higher index across cells) and calls the very same
+  `compute_viscosity`/`compute_density_diffusion` functions with the same
+  signature, so the GPU reproduces the CPU results instead of a "close"
+  variant. As on the CPU, the models receive the densities of the state being
+  evaluated (`ρᵢ, ρⱼ, ρᵢ⁻¹, ρⱼ⁻¹`) as arguments, so the corrector loop sees the
+  predictor density and velocity, and the reciprocals are computed once per
+  particle instead of once per pair.
 * **Dense uniform grid + counting sort.** Particles are binned into cells of
   edge `H` on a grid covering their bounding box (plus a one cell margin).
   A histogram (atomics), a prefix scan and a scatter reorder all particle

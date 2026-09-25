@@ -152,15 +152,20 @@ function download_particles!(SimParticles::StructArray, gpu::GPUParticles{D, T},
 end
 
 """
-Device arrays that are recomputed every step (half step state and shifting
-terms). They are never reordered because they are overwritten after every
-cell list update.
+Device arrays that are recomputed every step (half step state, reciprocal
+densities and shifting terms). They are never reordered because they are
+overwritten after every cell list update. `InvDensity` holds `1 / Density`
+of the start-of-step state and `InvDensityₙ⁺` that of the predictor state;
+the interaction kernel multiplies by them instead of dividing per pair
+(same as `FillInverseDensity!` of the CPU code).
 """
 struct GPUSupportArrays{D, T}
     dρdtI::CuVector{T}
     Velocityₙ⁺::CuVector{SVector{D, T}}
     Positionₙ⁺::CuVector{SVector{D, T}}
     ρₙ⁺::CuVector{T}
+    InvDensity::CuVector{T}
+    InvDensityₙ⁺::CuVector{T}
     ∇Cᵢ::CuVector{SVector{D, T}}
     ∇◌rᵢ::CuVector{T}
 end
@@ -170,6 +175,8 @@ function GPUSupportArrays{D, T}(n::Integer) where {D, T}
         CUDA.zeros(T, n),
         CUDA.zeros(SVector{D, T}, n),
         CUDA.zeros(SVector{D, T}, n),
+        CUDA.zeros(T, n),
+        CUDA.zeros(T, n),
         CUDA.zeros(T, n),
         CUDA.zeros(SVector{D, T}, n),
         CUDA.zeros(T, n),
@@ -335,9 +342,6 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
         end
         grid      = cl.grid
         CellStart = cl.CellStart
-        # Arrays read by the viscosity and density diffusion models (same
-        # convention as the CPU code: always the state at the start of the step)
-        SimParticlesNT = (Density = gpu.Density, Velocity = gpu.Velocity, Type = gpu.Type)
 
         # The pressure of the start-of-step density was already computed by the
         # final kernel of the previous step (and on the host before the first).
@@ -359,9 +363,12 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
             end
 
             @timeit HourGlass "04 First NeighborLoop" begin
+                # Reciprocal of the start-of-step density (after the mDBC correction
+                # and any reordering by the cell list rebuild).
+                sup.InvDensity .= inv.(gpu.Density)
                 launch_interactions!(sup.dρdtI, gpu.Acceleration, gpu.Kernel, gpu.KernelGradient, sup.∇Cᵢ, sup.∇◌rᵢ,
-                                     gpu.ChunkID, gpu.Position, gpu.Density, gpu.Pressure, gpu.Velocity,
-                                     gpu.Type, SimParticlesNT, CellStart, gpu.CellID, grid,
+                                     gpu.ChunkID, gpu.Position, gpu.Density, sup.InvDensity, gpu.Pressure,
+                                     gpu.Velocity, gpu.Type, CellStart, gpu.CellID, grid,
                                      SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                                      FlagKernel, FlagShift; threads = threads, lanes = lanes,
                                      boundary_forces = bforces)
@@ -370,7 +377,7 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
         end
 
         @timeit HourGlass "05b Update To Half TimeStep" begin
-            launch_half_step!(sup.Positionₙ⁺, sup.Velocityₙ⁺, sup.ρₙ⁺, gpu.Pressure,
+            launch_half_step!(sup.Positionₙ⁺, sup.Velocityₙ⁺, sup.ρₙ⁺, sup.InvDensityₙ⁺, gpu.Pressure,
                               gpu.Position, gpu.Velocity, gpu.Acceleration, gpu.Density, sup.dρdtI,
                               gpu.Type, gpu.GroupMarker, motion,
                               dt₂, SimMetaData.TotalTime, SimConstants)
@@ -378,9 +385,11 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
         end
 
         @timeit HourGlass "08 Second NeighborLoop" begin
+            # Corrector: every term, including the viscosity and density diffusion
+            # models, is evaluated at the predictor state.
             launch_interactions!(sup.dρdtI, gpu.Acceleration, gpu.Kernel, gpu.KernelGradient, sup.∇Cᵢ, sup.∇◌rᵢ,
-                                 gpu.ChunkID, sup.Positionₙ⁺, sup.ρₙ⁺, gpu.Pressure, sup.Velocityₙ⁺,
-                                 gpu.Type, SimParticlesNT, CellStart, gpu.CellID, grid,
+                                 gpu.ChunkID, sup.Positionₙ⁺, sup.ρₙ⁺, sup.InvDensityₙ⁺, gpu.Pressure,
+                                 sup.Velocityₙ⁺, gpu.Type, CellStart, gpu.CellID, grid,
                                  SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                                  FlagKernel, FlagShift; threads = threads, lanes = lanes,
                                  boundary_forces = bforces)
@@ -389,7 +398,7 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
 
         @timeit HourGlass "11 Update To Final TimeStep" begin
             launch_final_step!(gpu.Position, gpu.Velocity, gpu.Acceleration, gpu.Density, gpu.Pressure,
-                               sup.dρdtI, sup.ρₙ⁺, sup.Positionₙ⁺, gpu.Type,
+                               sup.dρdtI, sup.ρₙ⁺, sup.Positionₙ⁺, sup.Velocityₙ⁺, gpu.Type,
                                sup.∇Cᵢ, sup.∇◌rᵢ, dt, SimKernel, SimConstants, red, FlagShift)
             maybe_sync(SimMetaData)
         end

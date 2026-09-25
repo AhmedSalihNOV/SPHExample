@@ -127,7 +127,7 @@ end
 #---------------------------------------------------------------
 
 function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ, ChunkID,
-                             Position, Density, Pressure, Velocity, ParticleType, SimParticles,
+                             Position, Density, InvDensity, Pressure, Velocity, ParticleType, SimParticles,
                              CellStart, CellID, grid::CellGrid{D},
                              SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                              ::Val{FlagKernel}, ::Val{FlagShift}, ::Val{BoundaryForces}, ::Val{K},
@@ -152,6 +152,7 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
         xᵢ  = Position[i]
         vᵢ  = Velocity[i]
         ρᵢ  = Density[i]
+        ρᵢ⁻¹ = InvDensity[i]
         Pᵢ  = Pressure[i]
         MLᵢ = MotionLimiterValue(T, ParticleType[i])
 
@@ -179,31 +180,40 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
                         q     = clamp(dᵢⱼ * h⁻¹, zero(T), T(2))
                         ∇ᵢWᵢⱼ = @fastpow ∇Wᵢⱼ(SimKernel, q, xᵢⱼ)
 
-                        ρⱼ  = Density[j]
-                        vⱼ  = Velocity[j]
-                        vᵢⱼ = vᵢ - vⱼ
+                        ρⱼ   = Density[j]
+                        ρⱼ⁻¹ = InvDensity[j]
+                        vⱼ   = Velocity[j]
+                        vᵢⱼ  = vᵢ - vⱼ
                         density_symmetric_term = dot(-vᵢⱼ, ∇ᵢWᵢⱼ)
-                        dρdt += -ρᵢ * (m₀ / ρⱼ) * density_symmetric_term
+                        dρdt += -ρᵢ * (m₀ * ρⱼ⁻¹) * density_symmetric_term
 
                         # Which particle of the pair was `i` on the CPU? Evaluate the
                         # models from that particle's point of view (branch free: the
-                        # sign flip and index swap are selects).
+                        # sign flip and the swaps of index and density are selects).
+                        # The densities handed to the models are those of the arrays
+                        # being evaluated (the predictor state in the corrector loop).
                         same_cell = (j >= own_lo) & (j <= own_hi)
                         i_first   = same_cell ? (i < j) : (i > j)
-                        sgn = i_first ? one(T) : -one(T)
-                        ia  = i_first ? i : j
-                        ja  = i_first ? j : i
+                        sgn  = i_first ? one(T) : -one(T)
+                        ia   = i_first ? i : j
+                        ja   = i_first ? j : i
+                        ρa   = i_first ? ρᵢ : ρⱼ
+                        ρb   = i_first ? ρⱼ : ρᵢ
+                        ρa⁻¹ = i_first ? ρᵢ⁻¹ : ρⱼ⁻¹
+                        ρb⁻¹ = i_first ? ρⱼ⁻¹ : ρᵢ⁻¹
                         D1, D2 = compute_density_diffusion(SimDensityDiffusion, SimKernel, SimConstants,
-                                                           SimParticles, sgn * xᵢⱼ, sgn * ∇ᵢWᵢⱼ, xᵢⱼ², ia, ja)
+                                                           SimParticles, sgn * xᵢⱼ, sgn * ∇ᵢWᵢⱼ, xᵢⱼ²,
+                                                           ρa, ρb, ρa⁻¹, ρb⁻¹, ia, ja, ParticleType)
                         dρdt += i_first ? D1 : D2
 
                         if forces
                             v1, _ = compute_viscosity(SimViscosity, SimKernel, SimConstants, SimParticles,
-                                                      sgn * xᵢⱼ, sgn * vᵢⱼ, sgn * ∇ᵢWᵢⱼ, xᵢⱼ², ia, ja)
+                                                      sgn * xᵢⱼ, sgn * vᵢⱼ, sgn * ∇ᵢWᵢⱼ, xᵢⱼ²,
+                                                      ρa, ρb, ρa⁻¹, ρb⁻¹, ia, ja)
                             visc  = sgn * v1
 
                             Pⱼ   = Pressure[j]
-                            Pfac = (Pᵢ + Pⱼ) / (ρᵢ * ρⱼ)
+                            Pfac = (Pᵢ + Pⱼ) * (ρᵢ⁻¹ * ρⱼ⁻¹)
                             f_ab = tensile_correction(SimKernel, Pᵢ, ρᵢ, Pⱼ, ρⱼ, q, dx)
                             dvdt = -m₀ * (Pfac + f_ab) * ∇ᵢWᵢⱼ
                             acc += dvdt + visc
@@ -216,10 +226,10 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
 
                         if FlagShift
                             MLcond = MLᵢ * MotionLimiterValue(T, ParticleType[j])
-                            ∇C += (m₀ / ρᵢ) * ∇ᵢWᵢⱼ
+                            ∇C += (m₀ * ρᵢ⁻¹) * ∇ᵢWᵢⱼ
                             # Sign convention follows the CPU code, see
                             # https://arxiv.org/abs/2110.10076
-                            ∇r += (m₀ / ρⱼ) * dot(-xᵢⱼ, ∇ᵢWᵢⱼ) * MLcond
+                            ∇r += (m₀ * ρⱼ⁻¹) * dot(-xᵢⱼ, ∇ᵢWᵢⱼ) * MLcond
                         end
                     end
                 end
@@ -260,16 +270,19 @@ end
 """
     launch_interactions!(...; threads, lanes)
 
-Launch the gather interaction kernel. `Position`, `Density`, `Pressure` and
-`Velocity` are the arrays of the current stage (the half step arrays for the
-second neighbour loop), `SimParticles` is a NamedTuple with the `Density` and
-`Velocity` arrays that the viscosity and diffusion models read, exactly like
-the CPU code. `lanes` is the number of warp lanes per particle (`Val`). With
+Launch the gather interaction kernel. `Position`, `Density`, `InvDensity`,
+`Pressure` and `Velocity` are the arrays of the state being evaluated (the
+half step arrays for the second neighbour loop); `InvDensity` holds the
+precomputed reciprocals of `Density`. The viscosity and diffusion models
+receive the densities and reciprocals of this state as arguments, like the
+CPU code. Custom models additionally get the same arrays as the NamedTuple
+`SimParticles`, so nothing in the kernel can read a stale state. `lanes` is
+the number of warp lanes per particle (`Val`). With
 `boundary_forces = Val(false)` the momentum terms are skipped for particles
 with `MotionLimiter == 0`.
 """
 function launch_interactions!(dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ, ChunkID,
-                              Position, Density, Pressure, Velocity, ParticleType, SimParticles,
+                              Position, Density, InvDensity, Pressure, Velocity, ParticleType,
                               CellStart, CellID, grid,
                               SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                               FlagKernel::Val, FlagShift::Val; threads::Integer = 128, lanes::Val = Val(1),
@@ -277,9 +290,11 @@ function launch_interactions!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C
     n = length(Position)
     n == 0 && return nothing
     K = typeof(lanes).parameters[1]
+    SimParticles = (Position = Position, Density = Density, Velocity = Velocity, Pressure = Pressure,
+                    Type = ParticleType)
     @cuda threads=threads blocks=cld(n * K, threads) interaction_kernel!(
         dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ, ChunkID,
-        Position, Density, Pressure, Velocity, ParticleType, SimParticles,
+        Position, Density, InvDensity, Pressure, Velocity, ParticleType, SimParticles,
         CellStart, CellID, grid,
         SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
         FlagKernel, FlagShift, boundary_forces, lanes, Int32(n))
@@ -430,11 +445,11 @@ function launch_mdbc!(Density, Position, GhostPoints, ParticleType, CellStart, g
 end
 
 #---------------------------------------------------------------
-# Half step (symplectic predictor) fused with density limiting, motion and
-# the pressure of the half step density
+# Half step (symplectic predictor) fused with density limiting, motion, the
+# pressure of the half step density and its reciprocal
 #---------------------------------------------------------------
 
-function half_step_kernel!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, Pressure,
+function half_step_kernel!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, InvDensityₙ⁺, Pressure,
                            Position, Velocity, Acceleration, Density, dρdtI,
                            ParticleType, GroupMarker, motion, dt₂, TotalTime, SimConstants, n::Int32)
     i = thread_index()
@@ -452,6 +467,7 @@ function half_step_kernel!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, Pressure,
         ρ = Density[i] + dρdtI[i] * dt₂
         ρ = limit_density(ρ, ρ₀, ML)
         ρₙ⁺[i] = ρ
+        InvDensityₙ⁺[i] = inv(ρ)
 
         apply_motion!(i, Position, Velocity, ParticleType, GroupMarker, motion, dt₂, TotalTime)
 
@@ -460,13 +476,13 @@ function half_step_kernel!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, Pressure,
     return nothing
 end
 
-function launch_half_step!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, Pressure,
+function launch_half_step!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, InvDensityₙ⁺, Pressure,
                            Position, Velocity, Acceleration, Density, dρdtI,
                            ParticleType, GroupMarker, motion, dt₂, TotalTime, SimConstants)
     n = length(Position)
     n == 0 && return nothing
     @cuda threads=ELEMENTWISE_THREADS blocks=cld(n, ELEMENTWISE_THREADS) half_step_kernel!(
-        Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, Pressure,
+        Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, InvDensityₙ⁺, Pressure,
         Position, Velocity, Acceleration, Density, dρdtI,
         ParticleType, GroupMarker, motion, dt₂, TotalTime, SimConstants, Int32(n))
     return nothing
@@ -476,6 +492,10 @@ end
 # Final step: density limiting, density update, symplectic corrector, the
 # pressure for the next step and the per step reduction (time step limits and
 # displacement) for the next step.
+#
+# The corrector advances the position with the half step velocity `Velocityₙ⁺`
+# (the velocity the second neighbour loop was evaluated at) times `dt`, which
+# is the scheme of the CPU `FullTimeStep`.
 #---------------------------------------------------------------
 
 """
@@ -504,7 +524,7 @@ end
     SVector{3, T}(max(a[1], b[1]), min(a[2], b[2]), max(a[3], b[3]))
 
 function final_step_kernel!(Position, Velocity, Acceleration, Density, Pressure, dρdtI, ρₙ⁺, Positionₙ⁺,
-                            ParticleType, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
+                            Velocityₙ⁺, ParticleType, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
                             partial, ::Val{FlagShift}, n::Int32) where {FlagShift}
     (; g, ρ₀, c₀) = SimConstants
     T = eltype(Density)
@@ -527,10 +547,11 @@ function final_step_kernel!(Position, Velocity, Acceleration, Density, Pressure,
         acc = Acceleration[i]
         acc += ConstructGravitySVector(acc, g * GravityFactorValue(T, type))
         Acceleration[i] = acc
-        v_old = Velocity[i]
-        v     = v_old + acc * dt * ML
+        v = Velocity[i] + acc * dt * ML
         Velocity[i] = v
 
+        # Symplectic corrector: the position moves with the half step velocity
+        vₙ⁺ = Velocityₙ⁺[i]
         x = Position[i]
         if FlagShift
             D     = length(v)
@@ -538,10 +559,10 @@ function final_step_kernel!(Position, Velocity, Acceleration, Density, Pressure,
             A_FST = 0      # zero for internal flows
             A_FSM = D      # 2d, 3d val different
             A_FSC = (∇◌rᵢ[i] - A_FST) / (A_FSM - A_FST)
-            δxᵢ = A_FSC < 0 ? zero(v) : -A_FSC * A * SimKernel.h * norm(v) * dt * ∇Cᵢ[i]
-            x += (((v + (v - acc * dt * ML)) / 2) * dt + δxᵢ) * ML
+            δxᵢ = A_FSC < 0 ? zero(v) : -A_FSC * A * SimKernel.h * norm(vₙ⁺) * dt * ∇Cᵢ[i]
+            x += (vₙ⁺ * dt + δxᵢ) * ML
         else
-            x += (((v + (v - acc * dt * ML)) / 2) * dt) * ML
+            x += (vₙ⁺ * dt) * ML
         end
         Position[i] = x
 
@@ -561,13 +582,13 @@ per block reduction results fit the reduction workspace; finish the
 reduction with `finish_reduction(red, step_reduce, init)`.
 """
 function launch_final_step!(Position, Velocity, Acceleration, Density, Pressure, dρdtI, ρₙ⁺, Positionₙ⁺,
-                            ParticleType, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
+                            Velocityₙ⁺, ParticleType, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
                             red::ReductionWorkspace, FlagShift::Val)
     n = length(Position)
     n == 0 && return nothing
     @cuda threads=ELEMENTWISE_THREADS blocks=red.nblocks final_step_kernel!(
         Position, Velocity, Acceleration, Density, Pressure, dρdtI, ρₙ⁺, Positionₙ⁺,
-        ParticleType, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
+        Velocityₙ⁺, ParticleType, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
         red.partial, FlagShift, Int32(n))
     return nothing
 end

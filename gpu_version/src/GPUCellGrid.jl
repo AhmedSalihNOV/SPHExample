@@ -23,7 +23,7 @@ using ..GPUReductions
 
 export CellGrid, CellListWorkspace, update_cell_list!, unique_cells_host,
        map_floor, cell_coords, linear_cell, local_coords, row_offsets, in_grid,
-       gather_kernel!, thread_index
+       gather_kernel!, thread_index, load_grid
 
 const SORT_THREADS = 256
 
@@ -54,6 +54,17 @@ struct CellGrid{D}
 end
 
 CellGrid{D}() where {D} = CellGrid{D}(ntuple(_ -> Int32(0), Val(D)), ntuple(_ -> Int32(1), Val(D)), Int32(1))
+
+"""
+    load_grid(g) -> CellGrid
+
+Grid description for a kernel: either a `CellGrid` passed by value or the
+single element of a device vector (`CellListWorkspace.grid_dev`), which lets
+a kernel pick up the grid of the latest cell list rebuild without a change
+of its launch arguments.
+"""
+@inline load_grid(g::CellGrid) = g
+@inline load_grid(v::AbstractVector{<:CellGrid}) = @inbounds v[1]
 
 @inline function cell_coords(pos::SVector{D, T}, InverseCutOff) where {D, T}
     return ntuple(d -> map_floor(pos[d], InverseCutOff), Val(D))
@@ -122,10 +133,14 @@ end
 
 """
 Device side buffers of the cell list. Capacities grow on demand when the
-bounding box of the particles grows.
+bounding box of the particles grows; `generation` counts those
+reallocations so that holders of raw device pointers (captured graphs) can
+notice. `grid_dev` is a one element device copy of `grid` for the kernels.
 """
 mutable struct CellListWorkspace{D, T, R <: ReductionWorkspace}
     grid::CellGrid{D}
+    grid_dev::CuVector{CellGrid{D}}
+    generation::Int
     CellStart::CuVector{Int32}       # capacity >= ncells + 1
     Counts::CuVector{Int32}          # capacity >= ncells
     Perm::CuVector{Int32}            # length n, new index -> old index
@@ -141,6 +156,8 @@ function CellListWorkspace{D, T}(n::Integer; max_cells::Integer = 50_000_000,
     bbox_ws = ReductionWorkspace{SVector{2D, T}}(n)
     return CellListWorkspace{D, T, typeof(bbox_ws)}(
         CellGrid{D}(),
+        CuArray([CellGrid{D}()]),
+        0,
         CuVector{Int32}(undef, 1024),
         CuVector{Int32}(undef, 1024),
         CuVector{Int32}(undef, n),
@@ -244,6 +261,7 @@ function ensure_capacity!(ws::CellListWorkspace, ncells::Integer)
         CUDA.unsafe_free!(ws.Counts)
         ws.CellStart = CuVector{Int32}(undef, newlen)
         ws.Counts    = CuVector{Int32}(undef, newlen)
+        ws.generation += 1
     end
     return nothing
 end
@@ -279,6 +297,7 @@ function update_cell_list!(ws::CellListWorkspace{D, T}, Position::CuVector{SVect
     ncells = Int32(ncells_big)
     grid   = CellGrid{D}(cmin, dims, ncells)
     ws.grid = grid
+    fill!(ws.grid_dev, grid)
 
     ensure_capacity!(ws, ncells)
     Counts    = view(ws.Counts, 1:ncells)

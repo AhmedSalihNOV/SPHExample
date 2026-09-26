@@ -23,6 +23,7 @@ module SPHExampleGPU
         "OpenExternalPrograms.jl",
         "SPHDensityDiffusionModels.jl",
         "GPUReductions.jl",
+        "GPUStepState.jl",
         "GPUCellGrid.jl",
         "GPUKernels.jl",
         "SPHCellList.jl",
@@ -67,7 +68,8 @@ module SPHExampleGPU
            KernelOutputMode, NoKernelOutput, StoreKernelOutput,
            MDBCMode, NoMDBC, SimpleMDBC,
            LogMode, NoLog, StoreLog,
-           TimeSteppingMode, SymplecticTimeStepping, SingleNeighborTimeStepping
+           TimeSteppingMode, SymplecticTimeStepping, SingleNeighborTimeStepping,
+           OUTPUT_VARIABLES, DEFAULT_OUTPUT_VARIABLES, resolve_output_variables!
 
     using .SimulationConstantsConfiguration
     export SimulationConstants
@@ -75,15 +77,19 @@ module SPHExampleGPU
     using .GPUReductions
     export ReductionWorkspace, reduce_svector
 
+    using .GPUStepState
+    export StepState, HostStep, readback!
+
     using .GPUCellGrid
     export CellGrid, CellListWorkspace, update_cell_list!, unique_cells_host, map_floor
 
     using .GPUKernels
-    export launch_interactions!, launch_mdbc!, launch_motion!, launch_half_step!, launch_final_step!, choose_lanes
+    export launch_interactions!, launch_mdbc!, launch_motion!, launch_half_step!, launch_final_step!,
+           launch_finish!, launch_commit!, choose_lanes
 
     using .SPHCellList
     export GPUParticles, GPUSupportArrays, MotionArrays, upload_particles, download_particles!,
-           RunSimulation, SimulationLoop, StepReduction
+           RunSimulation, SimulationLoop
 
     using .OpenExternalPrograms
     export AutoOpenLogFile, AutoOpenParaview

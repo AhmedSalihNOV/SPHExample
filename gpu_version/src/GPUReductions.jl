@@ -16,8 +16,8 @@ module GPUReductions
 using CUDA
 using StaticArrays
 
-export ReductionWorkspace, reduce_svector, finish_reduction, block_reduce_store!,
-       REDUCE_THREADS
+export ReductionWorkspace, reduce_svector, launch_reduce!, finish_reduction, block_reduce,
+       block_reduce_store!, REDUCE_THREADS
 
 const REDUCE_THREADS = 256
 const REDUCE_MAX_BLOCKS = 512
@@ -48,13 +48,13 @@ function ReductionWorkspace{V}(n::Integer) where {V}
 end
 
 """
-    block_reduce_store!(partial, acc, op)
+    block_reduce(acc, op) -> V
 
 Reduce the per thread accumulators `acc` of the current block with `op`
-through shared memory and store the block result in `partial[blockIdx().x]`.
-Must be called by all threads of a block of exactly `REDUCE_THREADS` threads.
+through shared memory. Must be called by all threads of a block of exactly
+`REDUCE_THREADS` threads; every thread receives the block result.
 """
-@inline function block_reduce_store!(partial, acc::V, op::O) where {V, O}
+@inline function block_reduce(acc::V, op::O) where {V, O}
     tid = threadIdx().x
     shmem = CuStaticSharedArray(V, REDUCE_THREADS)
     @inbounds shmem[tid] = acc
@@ -69,8 +69,21 @@ Must be called by all threads of a block of exactly `REDUCE_THREADS` threads.
         s ÷= Int32(2)
     end
 
-    if tid == Int32(1)
-        @inbounds partial[blockIdx().x] = shmem[1]
+    @inbounds r = shmem[1]
+    sync_threads()
+    return r
+end
+
+"""
+    block_reduce_store!(partial, acc, op)
+
+`block_reduce` followed by a store of the block result in
+`partial[blockIdx().x]`.
+"""
+@inline function block_reduce_store!(partial, acc::V, op::O) where {V, O}
+    r = block_reduce(acc, op)
+    if threadIdx().x == Int32(1)
+        @inbounds partial[blockIdx().x] = r
     end
     return nothing
 end
@@ -108,6 +121,24 @@ function finish_reduction(ws::ReductionWorkspace{V}, op::O, init::V) where {V, O
 end
 
 """
+    launch_reduce!(ws, f, op, init, n, args...)
+
+Launch the reduction of `op` over `f(i, args...)` for `i in 1:n` into the
+per block partial results `ws.partial` without waiting for it. Combine them
+with `finish_reduction` (host) or a device side consumer.
+"""
+function launch_reduce!(ws::ReductionWorkspace{V}, f::F, op::O, init::V, n::Integer,
+                        args...) where {V, F, O}
+    if n == 0
+        fill!(ws.partial, init)
+        return nothing
+    end
+    @cuda threads=REDUCE_THREADS blocks=ws.nblocks reduce_kernel!(ws.partial, f, op, init,
+                                                                   Int32(n), args...)
+    return nothing
+end
+
+"""
     reduce_svector(ws, f, op, init, n, args...)
 
 Compute `op` over `f(i, args...)` for `i in 1:n` on the GPU. `f` receives the
@@ -117,8 +148,7 @@ Returns the final accumulator.
 function reduce_svector(ws::ReductionWorkspace{V}, f::F, op::O, init::V, n::Integer,
                         args...) where {V, F, O}
     n == 0 && return init
-    @cuda threads=REDUCE_THREADS blocks=ws.nblocks reduce_kernel!(ws.partial, f, op, init,
-                                                                   Int32(n), args...)
+    launch_reduce!(ws, f, op, init, n, args...)
     return finish_reduction(ws, op, init)
 end
 

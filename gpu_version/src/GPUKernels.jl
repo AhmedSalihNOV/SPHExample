@@ -19,6 +19,12 @@ CPU results exactly the gather kernel reconstructs which particle of a pair
 was the CPU's `i`: for pairs inside one cell the lower index, for pairs in
 different cells the particle in the cell that is processed (the higher index,
 because the CPU stencil only visits cells with a lower linear index).
+
+Every kernel of a time step takes the device resident step state (`step`, see
+`GPUStepState`) and reads the step size and the simulated time from it; the
+first thing each kernel does is to return when the stop flag is set. The grid
+description is read from a one element device vector (`load_grid`), so none
+of the launch arguments of a step change between steps.
 """
 module GPUKernels
 
@@ -33,8 +39,10 @@ using ..SimulationEquations
 using ..SimulationGeometry
 using ..GPUCellGrid
 using ..GPUReductions
+using ..GPUStepState
 
 export launch_interactions!, launch_mdbc!, launch_motion!, launch_half_step!, launch_final_step!,
+       launch_inv_density!, launch_finish!, launch_commit!, launch_step_reduction!,
        step_map, step_reduce, choose_lanes, ELEMENTWISE_THREADS
 
 const ELEMENTWISE_THREADS = REDUCE_THREADS
@@ -106,18 +114,42 @@ end
 # Prescribed motion of moving bodies (only launched when a case has them)
 #---------------------------------------------------------------
 
-function motion_kernel!(Position, Velocity, ParticleType, GroupMarker, motion, dt₂, TotalTime, n::Int32)
+function motion_kernel!(Position, Velocity, ParticleType, GroupMarker, motion, step, n::Int32)
+    step_active(step) || return nothing
     i = thread_index()
     i > n && return nothing
+    dt₂       = step_dt(step) / 2
+    TotalTime = step_time(step)
     apply_motion!(i, Position, Velocity, ParticleType, GroupMarker, motion, dt₂, TotalTime)
     return nothing
 end
 
-function launch_motion!(Position, Velocity, ParticleType, GroupMarker, motion, dt₂, TotalTime)
+function launch_motion!(Position, Velocity, ParticleType, GroupMarker, motion, step)
     n = length(Position)
     n == 0 && return nothing
     @cuda threads=ELEMENTWISE_THREADS blocks=cld(n, ELEMENTWISE_THREADS) motion_kernel!(
-        Position, Velocity, ParticleType, GroupMarker, motion, dt₂, TotalTime, Int32(n))
+        Position, Velocity, ParticleType, GroupMarker, motion, step, Int32(n))
+    return nothing
+end
+
+#---------------------------------------------------------------
+# Reciprocal of the start-of-step density (after the mDBC correction and any
+# reordering by a cell list rebuild)
+#---------------------------------------------------------------
+
+function inv_density_kernel!(InvDensity, Density, step, n::Int32)
+    step_active(step) || return nothing
+    i = thread_index()
+    i > n && return nothing
+    @inbounds InvDensity[i] = inv(Density[i])
+    return nothing
+end
+
+function launch_inv_density!(InvDensity, Density, step)
+    n = length(Density)
+    n == 0 && return nothing
+    @cuda threads=ELEMENTWISE_THREADS blocks=cld(n, ELEMENTWISE_THREADS) inv_density_kernel!(
+        InvDensity, Density, step, Int32(n))
     return nothing
 end
 
@@ -125,12 +157,15 @@ end
 # Particle interactions (gather)
 #---------------------------------------------------------------
 
-function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ, ChunkID,
-                             Position, Density, InvDensity, Pressure, Velocity, ParticleType, SimParticles,
-                             CellStart, CellID, grid::CellGrid{D},
+function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ,
+                             Position::AbstractVector{SVector{D, T}}, Density, InvDensity, Pressure,
+                             Velocity, ParticleType, SimParticles,
+                             CellStart, CellID, gridarg, step,
                              SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                              ::Val{FlagKernel}, ::Val{FlagShift}, ::Val{BoundaryForces}, ::Val{K},
-                             n::Int32) where {D, FlagKernel, FlagShift, BoundaryForces, K}
+                             n::Int32) where {D, T, FlagKernel, FlagShift, BoundaryForces, K}
+    step_active(step) || return nothing
+    grid = load_grid(gridarg)
     t    = thread_index()
     i    = (t - Int32(1)) ÷ Int32(K) + Int32(1)
     lane = (t - Int32(1)) % Int32(K)
@@ -139,7 +174,6 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
     (; m₀, dx)  = SimConstants
     (; h⁻¹, H²) = SimKernel
 
-    T = eltype(eltype(Position))
     dρdt  = zero(T)
     acc   = zero(SVector{D, T})
     Wsum  = zero(T)
@@ -261,7 +295,6 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
             ∇Cᵢ[i]  = ∇C
             ∇◌rᵢ[i] = ∇r
         end
-        ChunkID[i] = Int(blockIdx().x)
     end
     return nothing
 end
@@ -275,14 +308,15 @@ half step arrays for the second neighbour loop); `InvDensity` holds the
 precomputed reciprocals of `Density`. The viscosity and diffusion models
 receive the densities and reciprocals of this state as arguments, like the
 CPU code. Custom models additionally get the same arrays as the NamedTuple
-`SimParticles`, so nothing in the kernel can read a stale state. `lanes` is
-the number of warp lanes per particle (`Val`). With
-`boundary_forces = Val(false)` the momentum terms are skipped for particles
-with `MotionLimiter == 0`.
+`SimParticles`, so nothing in the kernel can read a stale state. `grid` is a
+`CellGrid` or the device vector holding it, `step` the step state (see
+`GPUStepState`). `lanes` is the number of warp lanes per particle (`Val`).
+With `boundary_forces = Val(false)` the momentum terms are skipped for
+particles with `MotionLimiter == 0`.
 """
-function launch_interactions!(dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ, ChunkID,
+function launch_interactions!(dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ,
                               Position, Density, InvDensity, Pressure, Velocity, ParticleType,
-                              CellStart, CellID, grid,
+                              CellStart, CellID, grid, step,
                               SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                               FlagKernel::Val, FlagShift::Val; threads::Integer = 128, lanes::Val = Val(1),
                               boundary_forces::Val = Val(true))
@@ -292,9 +326,9 @@ function launch_interactions!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C
     SimParticles = (Position = Position, Density = Density, Velocity = Velocity, Pressure = Pressure,
                     Type = ParticleType)
     @cuda threads=threads blocks=cld(n * K, threads) interaction_kernel!(
-        dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ, ChunkID,
+        dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ,
         Position, Density, InvDensity, Pressure, Velocity, ParticleType, SimParticles,
-        CellStart, CellID, grid,
+        CellStart, CellID, grid, step,
         SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
         FlagKernel, FlagShift, boundary_forces, lanes, Int32(n))
     return nothing
@@ -384,13 +418,15 @@ end
     return b, A
 end
 
-function mdbc_kernel!(Density, Position, GhostPoints, ParticleType, CellStart, grid::CellGrid{D},
-                      SimKernel, SimConstants, ::Val{K}, n::Int32) where {D, K}
+function mdbc_kernel!(Density, Position::AbstractVector{SVector{D, T}}, GhostPoints, ParticleType,
+                      CellStart, gridarg, step,
+                      SimKernel, SimConstants, ::Val{K}, n::Int32) where {D, T, K}
+    step_active(step) || return nothing
+    grid = load_grid(gridarg)
     t    = thread_index()
     i    = (t - Int32(1)) ÷ Int32(K) + Int32(1)
     lane = (t - Int32(1)) % Int32(K)
 
-    T  = eltype(eltype(Position))
     DP = D + 1
     (; m₀, ρ₀) = SimConstants
 
@@ -433,13 +469,14 @@ function mdbc_kernel!(Density, Position, GhostPoints, ParticleType, CellStart, g
     return nothing
 end
 
-function launch_mdbc!(Density, Position, GhostPoints, ParticleType, CellStart, grid, SimKernel,
+function launch_mdbc!(Density, Position, GhostPoints, ParticleType, CellStart, grid, step, SimKernel,
                       SimConstants; threads::Integer = 128, lanes::Val = Val(1))
     n = length(Density)
     n == 0 && return nothing
     K = typeof(lanes).parameters[1]
     @cuda threads=threads blocks=cld(n * K, threads) mdbc_kernel!(
-        Density, Position, GhostPoints, ParticleType, CellStart, grid, SimKernel, SimConstants, lanes, Int32(n))
+        Density, Position, GhostPoints, ParticleType, CellStart, grid, step, SimKernel, SimConstants, lanes,
+        Int32(n))
     return nothing
 end
 
@@ -450,9 +487,12 @@ end
 
 function half_step_kernel!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, InvDensityₙ⁺, Pressure,
                            Position, Velocity, Acceleration, Density, dρdtI,
-                           ParticleType, GroupMarker, motion, dt₂, TotalTime, SimConstants, n::Int32)
+                           ParticleType, GroupMarker, motion, step, SimConstants, n::Int32)
+    step_active(step) || return nothing
     i = thread_index()
     i > n && return nothing
+    dt₂       = step_dt(step) / 2
+    TotalTime = step_time(step)
     (; g, ρ₀, c₀) = SimConstants
     T = eltype(Density)
     @inbounds begin
@@ -477,13 +517,13 @@ end
 
 function launch_half_step!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, InvDensityₙ⁺, Pressure,
                            Position, Velocity, Acceleration, Density, dρdtI,
-                           ParticleType, GroupMarker, motion, dt₂, TotalTime, SimConstants)
+                           ParticleType, GroupMarker, motion, step, SimConstants)
     n = length(Position)
     n == 0 && return nothing
     @cuda threads=ELEMENTWISE_THREADS blocks=cld(n, ELEMENTWISE_THREADS) half_step_kernel!(
         Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, InvDensityₙ⁺, Pressure,
         Position, Velocity, Acceleration, Density, dρdtI,
-        ParticleType, GroupMarker, motion, dt₂, TotalTime, SimConstants, Int32(n))
+        ParticleType, GroupMarker, motion, step, SimConstants, Int32(n))
     return nothing
 end
 
@@ -523,8 +563,10 @@ end
     SVector{3, T}(max(a[1], b[1]), min(a[2], b[2]), max(a[3], b[3]))
 
 function final_step_kernel!(Position, Velocity, Acceleration, Density, Pressure, dρdtI, ρₙ⁺, Positionₙ⁺,
-                            Velocityₙ⁺, ParticleType, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
+                            Velocityₙ⁺, ParticleType, ∇Cᵢ, ∇◌rᵢ, step, SimKernel, SimConstants,
                             partial, ::Val{FlagShift}, n::Int32) where {FlagShift}
+    step_active(step) || return nothing
+    dt = step_dt(step)
     (; g, ρ₀, c₀) = SimConstants
     T = eltype(Density)
     acc_red = SVector{3, T}(zero(T), T(Inf), zero(T))
@@ -577,18 +619,124 @@ end
 
 """
 Launch the final step. Uses `red.nblocks` blocks in a grid stride loop so the
-per block reduction results fit the reduction workspace; finish the
-reduction with `finish_reduction(red, step_reduce, init)`.
+per block reduction results fit the reduction workspace; they are consumed by
+`launch_finish!` (device) or `finish_reduction(red, step_reduce, init)` (host).
+`step` is a `StepState` or a `HostStep` with a fixed `dt`.
 """
 function launch_final_step!(Position, Velocity, Acceleration, Density, Pressure, dρdtI, ρₙ⁺, Positionₙ⁺,
-                            Velocityₙ⁺, ParticleType, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
+                            Velocityₙ⁺, ParticleType, ∇Cᵢ, ∇◌rᵢ, step, SimKernel, SimConstants,
                             red::ReductionWorkspace, FlagShift::Val)
     n = length(Position)
     n == 0 && return nothing
     @cuda threads=ELEMENTWISE_THREADS blocks=red.nblocks final_step_kernel!(
         Position, Velocity, Acceleration, Density, Pressure, dρdtI, ρₙ⁺, Positionₙ⁺,
-        Velocityₙ⁺, ParticleType, ∇Cᵢ, ∇◌rᵢ, dt, SimKernel, SimConstants,
+        Velocityₙ⁺, ParticleType, ∇Cᵢ, ∇◌rᵢ, step, SimKernel, SimConstants,
         red.partial, FlagShift, Int32(n))
+    return nothing
+end
+
+"""
+    launch_step_reduction!(red, Position, Velocity, Acceleration, Positionₙ⁺, SimKernel)
+
+Per block partial results of the step reduction for a state that was not
+produced by `launch_final_step!` (the initial state). Consumed by
+`launch_finish!`.
+"""
+function launch_step_reduction!(red::ReductionWorkspace{SVector{3, T}}, Position, Velocity, Acceleration,
+                                Positionₙ⁺, SimKernel) where {T}
+    init = SVector{3, T}(zero(T), T(Inf), zero(T))
+    launch_reduce!(red, step_map, step_reduce, init, length(Position), Position, Velocity, Acceleration,
+                   Positionₙ⁺, T(SimKernel.h), T(SimKernel.η²))
+    return nothing
+end
+
+#---------------------------------------------------------------
+# Device side loop control: time step from the reduction of the previous
+# step (with the cell list rebuild and output time decisions) and the commit
+# of a completed step. Both replace host work that needed a synchronization.
+#---------------------------------------------------------------
+
+# One block of REDUCE_THREADS threads. Combines the per block partial results
+# into the time step of the next step, exactly like the host used to:
+# `dt = CFL * min(dt1, h / (c₀ + visc))`, `Δx += 4 * maxdisp`. Sets the stop
+# flag when the output time is reached (before computing anything) or when
+# the accumulated displacement bound requires a cell list rebuild.
+function finish_kernel!(step::DeviceStep{T}, partial, nblocks::Int32, CFL::T, c₀::T, h::T) where {T}
+    f = step.f
+    s = step.i
+    @inbounds begin
+        s[I_STOP] == STOP_NONE || return nothing
+        phase = s[I_PHASE]
+        if phase == PHASE_NEED_DT && f[F_TIME] > f[F_TOUT]
+            if threadIdx().x == Int32(1)
+                s[I_STOP] = STOP_OUTPUT
+            end
+            return nothing
+        end
+        # `dt` was computed before a rebuild interrupted the step: keep it.
+        phase == PHASE_DT_READY && return nothing
+    end
+
+    acc = SVector{3, T}(zero(T), T(Inf), zero(T))
+    b = threadIdx().x
+    @inbounds while b <= nblocks
+        acc = step_reduce(acc, partial[b])
+        b += blockDim().x
+    end
+    r = block_reduce(acc, step_reduce)
+
+    if threadIdx().x == Int32(1)
+        @inbounds begin
+            visc = r[1]
+            dt1  = r[2]
+            dt   = CFL * min(dt1, h / (c₀ + visc))
+            d4   = 4 * r[3]
+            dx   = f[F_DX] + d4
+            f[F_DT]   = dt
+            f[F_DISP] = d4
+            f[F_DX]   = dx
+            s[I_PHASE] = PHASE_DT_READY
+            if dx >= h
+                s[I_STOP] = STOP_REBUILD
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    launch_finish!(state, red, SimKernel, SimConstants)
+
+Compute the time step of the next step on the device from the reduction in
+`red` (see `finish_kernel!`).
+"""
+function launch_finish!(state::StepState{T}, red::ReductionWorkspace{SVector{3, T}}, SimKernel,
+                        SimConstants) where {T}
+    @cuda threads=REDUCE_THREADS blocks=1 finish_kernel!(state, red.partial, Int32(red.nblocks),
+                                                        T(SimConstants.CFL), T(SimConstants.c₀),
+                                                        T(SimKernel.h))
+    return nothing
+end
+
+# Single thread. Advances the time and the iteration counter after a step ran.
+function commit_kernel!(step::DeviceStep)
+    f = step.f
+    s = step.i
+    @inbounds if s[I_STOP] == STOP_NONE
+        f[F_TIME] += f[F_DT]
+        s[I_ITER] += Int32(1)
+        s[I_PHASE] = PHASE_NEED_DT
+    end
+    return nothing
+end
+
+"""
+    launch_commit!(state)
+
+Commit the step that was just launched: `TotalTime += dt`, `Iteration += 1`.
+"""
+function launch_commit!(state::StepState)
+    @cuda threads=1 blocks=1 commit_kernel!(state)
     return nothing
 end
 

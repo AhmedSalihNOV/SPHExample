@@ -27,21 +27,22 @@ function setup(case::BenchCase, ::Type{T}) where {T}
     red = ReductionWorkspace{SVector{3, T}}(n)
     cl  = CellListWorkspace{case.dims, T}(n)
     mot = MotionArrays(kw.SimGeometry, particles)
+    st  = StepState{T}(; dx = one(T) + kw.SimKernel.h)
     # `RunSimulation` normally stores the scheme in the meta data; done here
     # because `SimulationLoop` is driven directly.
     kw.SimMetaData.TimeSteppingMode = kw.SimTimeStepping
     kw.SimMetaData.OutputIterationCounter = 1
-    return kw, gpu, sup, red, cl, mot
+    return kw, gpu, sup, red, cl, mot, st
 end
 
 function main(args)
     T = "--float32" in args ? Float32 : Float64
     names = filter(a -> !startswith(a, "--"), args)
     case  = first(select_cases(names))
-    kw, gpu, sup, red, cl, mot = setup(case, T)
+    kw, gpu, sup, red, cl, mot, st = setup(case, T)
     meta = kw.SimMetaData
     loop() = SimulationLoop(kw.SimDensityDiffusion, kw.SimViscosity, kw.SimKernel, meta, kw.SimConstants,
-                            gpu, cl, sup, red, mot)
+                            gpu, cl, sup, red, mot, st)
     # warm up / compile: one output interval
     loop(); CUDA.synchronize()
     it0 = meta.Iteration

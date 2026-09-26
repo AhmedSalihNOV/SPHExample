@@ -7,7 +7,8 @@ export SimulationMetaData, UpdateMetaData!, ShiftingMode, NoShifting, PlanarShif
        KernelOutputMode, NoKernelOutput, StoreKernelOutput,
        MDBCMode, NoMDBC, SimpleMDBC,
        LogMode, NoLog, StoreLog,
-       TimeSteppingMode, SymplecticTimeStepping, SingleNeighborTimeStepping
+       TimeSteppingMode, SymplecticTimeStepping, SingleNeighborTimeStepping,
+       OUTPUT_VARIABLES, DEFAULT_OUTPUT_VARIABLES, resolve_output_variables!
 
 # Mode types shared with the CPU package. They select code paths at compile
 # time (as type parameters of `SimulationMetaData`) instead of run time flags,
@@ -89,23 +90,71 @@ mutable struct SimulationMetaData{Dimensions,
     GPULanesPerParticle::Int     # warp lanes per particle in the gather kernels (0 = automatic)
     GPUBoundaryForces::Bool      # also evaluate the momentum equation for boundary particles (CPU parity)
     GPUAsyncOutput::Bool         # write output files on a Julia task while the GPU continues
+    GPUMaxStepsPerSync::Int      # upper bound on the time steps enqueued between two host read backs
+    GPUUseGraph::Bool            # replay the launch sequence of a step as a CUDA graph
 end
 
-const DEFAULT_OUTPUT_VARIABLES = [
-    "ChunkID",
-    "Kernel",
-    "KernelGradient",
+# Particle fields that can be written to the output files. `Position` is always
+# written as the point coordinates and is not listed. `Kernel` and
+# `KernelGradient` are only computed with `KMode = StoreKernelOutput`, the mDBC
+# ghost data only exists with `BMode = SimpleMDBC`; in every other mode these
+# fields would be written as zeros, so `resolve_output_variables!` drops them.
+const OUTPUT_VARIABLES = [
+    "Velocity",
     "Density",
     "Pressure",
-    "Velocity",
     "Acceleration",
-    "BoundaryBool",
     "ID",
     "Type",
     "GroupMarker",
+    "Kernel",
+    "KernelGradient",
     "GhostPoints",
     "GhostNormals",
 ]
+
+# The state and identity of every particle. Diagnostics (`Acceleration`, the
+# kernel sums and the ghost data) are opt in through `OutputVariables`.
+const DEFAULT_OUTPUT_VARIABLES = [
+    "Velocity",
+    "Density",
+    "Pressure",
+    "ID",
+    "Type",
+    "GroupMarker",
+]
+
+"""
+    resolve_output_variables!(SimMetaData) -> Vector{String}
+
+Validate `SimMetaData.OutputVariables` against the mode type parameters and
+drop, with a warning, the variables this run never fills with data (the kernel
+sums without `StoreKernelOutput`, the ghost data without `SimpleMDBC`). Unknown
+names are an error. The trimmed list is stored back into the meta data so that
+the writer, the GPU download and the ParaView state file all agree on it.
+"""
+function resolve_output_variables!(SimMetaData::SimulationMetaData{D, T, SMode, KMode, BMode}) where {D, T, SMode, KMode, BMode}
+    requested = SimMetaData.OutputVariables
+    unknown   = setdiff(requested, OUTPUT_VARIABLES)
+    if !isempty(unknown)
+        hint = any(in(("ChunkID", "BoundaryBool")), unknown) ?
+               " `ChunkID` and `BoundaryBool` are no longer written: the first carried no information " *
+               "on the GPU and the second equals `Type != Fluid`." : ""
+        error("Unknown output variable(s) $(unknown). Available: $(OUTPUT_VARIABLES)." * hint)
+    end
+    keep = String[]
+    for name in unique(requested)
+        if name in ("Kernel", "KernelGradient") && KMode !== StoreKernelOutput
+            @warn "Output variable `$name` is only computed with the `StoreKernelOutput` kernel mode and is not written."
+        elseif name in ("GhostPoints", "GhostNormals") && BMode !== SimpleMDBC
+            @warn "Output variable `$name` only exists with the `SimpleMDBC` boundary mode and is not written."
+        else
+            push!(keep, name)
+        end
+    end
+    SimMetaData.OutputVariables = keep
+    return keep
+end
 
 _output_times(::Type{T}, x::Real) where {T} = T(x)
 _output_times(::Type{T}, x::AbstractVector) where {T} = Vector{T}(x)
@@ -137,6 +186,8 @@ function SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode}(;
         GPULanesPerParticle::Int                = 0,
         GPUBoundaryForces::Bool                 = true,
         GPUAsyncOutput::Bool                    = true,
+        GPUMaxStepsPerSync::Int                 = 32,
+        GPUUseGraph::Bool                       = true,
     ) where {Dimensions, FloatType <: AbstractFloat, SMode <: ShiftingMode, KMode <: KernelOutputMode,
              BMode <: MDBCMode, LMode <: LogMode}
     return SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode}(
@@ -147,7 +198,7 @@ function SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode}(;
         IndexCounter, ProgressSpecification, VisualizeInParaview, ExportSingleVTKHDF, ExportGridCells,
         OutputVariables, OpenLogFile, TimeSteppingMode,
         GPUSyncTimers, GPUDeterministicSort, GPUMaxCells, GPUInteractionThreads, GPULanesPerParticle,
-        GPUBoundaryForces, GPUAsyncOutput,
+        GPUBoundaryForces, GPUAsyncOutput, GPUMaxStepsPerSync, GPUUseGraph,
     )
 end
 

@@ -86,8 +86,6 @@ function AllocateDataStructures(SimGeometry::Vector{<:Geometry{Dimensions, Float
     PositionType             = eltype(Position)
     PositionUnderlyingType   = eltype(PositionType)
 
-    BoundaryBool  = UInt8.(Types .!= Fluid)
-
     Acceleration    = zeros(PositionType, NumberOfPoints)
     Velocity        = zeros(PositionType, NumberOfPoints)
     Kernel          = zeros(PositionUnderlyingType, NumberOfPoints)
@@ -98,9 +96,8 @@ function AllocateDataStructures(SimGeometry::Vector{<:Geometry{Dimensions, Float
     Pressureᵢ      = zeros(PositionUnderlyingType, NumberOfPoints)
     
     Cells          = fill(zero(CartesianIndex{Dimensions}), NumberOfPoints)
-    ChunkID        = zeros(Int, NumberOfPoints)
 
-    SimParticles = StructArray((Cells = Cells, ChunkID = ChunkID, Kernel = Kernel, KernelGradient = KernelGradient, Position=Position, Acceleration=Acceleration, Velocity=Velocity, Density=Density, Pressure=Pressureᵢ, BoundaryBool = BoundaryBool, ID = Idp , Type = Types, GroupMarker = GroupMarker, GhostPoints = GhostPoints, GhostNormals=GhostNormals))
+    SimParticles = StructArray((Cells = Cells, Kernel = Kernel, KernelGradient = KernelGradient, Position=Position, Acceleration=Acceleration, Velocity=Velocity, Density=Density, Pressure=Pressureᵢ, ID = Idp , Type = Types, GroupMarker = GroupMarker, GhostPoints = GhostPoints, GhostNormals=GhostNormals))
 
     sort!(SimParticles, by = p -> p.ID)
 

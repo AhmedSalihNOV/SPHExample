@@ -101,9 +101,8 @@ struct ZeroGravityLinearDensityDiffusion <: SPHDensityDiffusion end
         ρⱼᵢ = ρⱼ - ρᵢ
         ψᵢⱼ = 2 * ρⱼᵢ * (-xᵢⱼ) * invdᵢⱼ²η²
 
-        ψ∇W = dot(ψᵢⱼ, ∇ᵢWᵢⱼ)  # TEMP-BRANCH-DJ
-        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * ψ∇W
-        Dⱼ  = δᵩ * h * c₀ * (m₀ * ρᵢ⁻¹) * -ψ∇W
+        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ)
+        Dⱼ  = -Dᵢ
 
 
         return Dᵢ, Dⱼ
@@ -154,9 +153,8 @@ struct LinearDensityDiffusion <: SPHDensityDiffusion end
         MLcond = MotionLimiterValue(typeof(ρᵢ), ParticleType[i]) *
                  MotionLimiterValue(typeof(ρᵢ), ParticleType[j])
 
-        ψ∇W = dot(ψᵢⱼ, ∇ᵢWᵢⱼ)  # TEMP-BRANCH-DJ
-        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * ψ∇W * MLcond
-        Dⱼ  = δᵩ * h * c₀ * (m₀ * ρᵢ⁻¹) * -ψ∇W * MLcond
+        Dᵢ  = δᵩ * h * c₀ * (m₀ * ρⱼ⁻¹) * dot(ψᵢⱼ, ∇ᵢWᵢⱼ) * MLcond
+        Dⱼ  = -Dᵢ
 
         return Dᵢ, Dⱼ
 end

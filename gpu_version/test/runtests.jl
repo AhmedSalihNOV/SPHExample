@@ -128,6 +128,68 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
         end
     end
 
+    @testset "final step corrector advances with the half step velocity" begin
+        # The symplectic corrector of the CPU `FullTimeStep` moves the position
+        # with `Velocityₙ⁺ * dt`. The GPU kernel is checked element by element
+        # against that formula (with and without shifting) and against the
+        # earlier averaged velocity scheme, which it must not reproduce.
+        T = Float64
+        V = SVector{2, T}
+        n = 4_096
+        rnd() = V(randn(T), randn(T))
+        types  = rand([Fluid, Fixed, Moving], n)
+        consts = SimulationConstants{T}(dx = 0.02, c₀ = 42.0, δᵩ = 0.1, CFL = 0.5)
+        kern   = SPHKernelInstance{2, T}(WendlandC2(); dx = consts.dx)
+        dt     = T(1e-4)
+        for FlagShift in (false, true)
+            Position     = [rnd() for _ in 1:n]
+            Velocity     = [rnd() for _ in 1:n]
+            Acceleration = [10 * rnd() for _ in 1:n]
+            Velocityₙ⁺   = [rnd() for _ in 1:n]
+            Positionₙ⁺   = Position .+ [1e-3 * rnd() for _ in 1:n]
+            Density  = 1000 .+ 50 .* rand(T, n)
+            ρₙ⁺      = 1000 .+ 50 .* rand(T, n)
+            dρdtI    = randn(T, n)
+            ∇Cᵢ      = [rnd() for _ in 1:n]
+            ∇◌rᵢ     = 4 .* rand(T, n) .- 1     # negative values must give no shift
+
+            dP  = CuArray(Position);      dV  = CuArray(Velocity)
+            dA  = CuArray(Acceleration);  dρ  = CuArray(Density)
+            dPr = CUDA.zeros(T, n);       ddρ = CuArray(dρdtI)
+            dρn = CuArray(ρₙ⁺);           dPn = CuArray(Positionₙ⁺)
+            dVn = CuArray(Velocityₙ⁺);    dty = CuArray(types)
+            dC  = CuArray(∇Cᵢ);           dr  = CuArray(∇◌rᵢ)
+            red = ReductionWorkspace{SVector{3, T}}(n)
+            launch_final_step!(dP, dV, dA, dρ, dPr, ddρ, dρn, dPn, dVn, dty, dC, dr,
+                               dt, kern, consts, red, Val(FlagShift))
+            xg = Array(dP)
+            vg = Array(dV)
+
+            x_ref = similar(Position); v_ref = similar(Velocity); x_avg = similar(Position)
+            for i in 1:n
+                ML  = MotionLimiterValue(T, types[i])
+                GF  = GravityFactorValue(T, types[i])
+                acc = Acceleration[i] + ConstructGravitySVector(Acceleration[i], consts.g * GF)
+                v   = Velocity[i] + acc * dt * ML
+                δx  = zero(V)
+                if FlagShift
+                    A_FSC = (∇◌rᵢ[i] - 0) / (2 - 0)
+                    δx = A_FSC < 0 ? zero(V) : -A_FSC * 2 * kern.h * norm(Velocityₙ⁺[i]) * dt * ∇Cᵢ[i]
+                end
+                v_ref[i] = v
+                x_ref[i] = Position[i] + (Velocityₙ⁺[i] * dt + δx) * ML
+                x_avg[i] = Position[i] + (((v + (v - acc * dt * ML)) / 2) * dt + δx) * ML
+            end
+            @test all(isapprox.(vg, v_ref; rtol = 1e-13, atol = 1e-15))
+            @test all(isapprox.(xg, x_ref; rtol = 1e-13, atol = 1e-15))
+            # the old averaged scheme differs for every moving particle
+            moving = types .== Fluid
+            @test maximum(norm.(xg[moving] .- x_avg[moving])) > 1e-6
+            # non-fluid particles do not move
+            @test all(xg[.!moving] .== Position[.!moving])
+        end
+    end
+
     @testset "models use the densities passed by the kernel" begin
         # The kernel hands the models ρᵢ, ρⱼ and their reciprocals of the state
         # being evaluated. The built in models must not reach back into a

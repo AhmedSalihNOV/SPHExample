@@ -76,7 +76,9 @@ the standard *gather* formulation:
 * **Fused element-wise kernels.** Half step, density limiting, prescribed
   motion and pressure are one kernel; the final step also computes the
   pressure for the next step and the block wise reduction of the time step
-  limits and the maximum displacement. A step therefore consists of 4 kernel
+  limits and the maximum displacement. The corrector advances the position
+  with the half step velocity times `dt`, the same symplectic scheme as the
+  CPU `FullTimeStep`. A step therefore consists of 4 kernel
   launches (6 with mDBC and moving bodies) and one 12 byte device to host
   copy for the time step, which keeps the small 2D cases from being launch
   bound.

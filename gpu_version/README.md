@@ -63,6 +63,20 @@ the standard *gather* formulation:
   evaluated (`ρᵢ, ρⱼ, ρᵢ⁻¹, ρⱼ⁻¹`) as arguments, so the corrector loop sees the
   predictor density and velocity, and the reciprocals are computed once per
   particle instead of once per pair.
+* **Fluid gating of density diffusion by select, not early exit.** The
+  `LinearDensityDiffusion` and `ComplexDensityDiffusion` terms act only between
+  two fluid particles. The CPU code returns early when either particle is not
+  fluid (about 6% faster there). On the GPU that `return` is a divergent branch
+  inside the pair loop: it pays off for warps of boundary particles and costs
+  in warps of fluid particles with boundary neighbours. Measured on an RTX
+  A1000 (Float32, pair kernel time, 9 interleaved rounds, median ratio to the
+  old MotionLimiter multiply): early exit 1.00 (DamBreak2D), 1.02
+  (StillWedge2D), 1.01 (DamBreak3D), 0.99 (Duckling3D), a wash; a branch
+  free select of the finished term 0.98, 0.99, 0.90, 0.96. The models
+  therefore compute the term unconditionally and select it. A multiply by one
+  is exact, so this is equivalent to the old form; the only differences seen
+  in tests are ulp level and come from FMA contraction in `dot`, which can
+  change with any recompile.
 * **Dense uniform grid + counting sort.** Particles are binned into cells of
   edge `H` on a grid covering their bounding box (plus a one cell margin).
   A histogram (atomics), a prefix scan and a scatter reorder all particle
@@ -78,10 +92,20 @@ the standard *gather* formulation:
   pressure for the next step and the block wise reduction of the time step
   limits and the maximum displacement. The corrector advances the position
   with the half step velocity times `dt`, the same symplectic scheme as the
-  CPU `FullTimeStep`. A step therefore consists of 4 kernel
-  launches (6 with mDBC and moving bodies) and one 12 byte device to host
-  copy for the time step, which keeps the small 2D cases from being launch
-  bound.
+  CPU `FullTimeStep`. A step therefore consists of 6 kernel launches (8
+  with mDBC and moving bodies), two of which are single block kernels that
+  do the loop control.
+* **Device resident time step.** The time step, the simulated time, the
+  displacement bound that triggers a cell list rebuild and the loop flags
+  live on the device. A single block kernel turns the block wise reduction
+  of the previous step into `dt` and decides whether the step may run; the
+  other kernels read `dt` from device memory and exit at once when it may
+  not. The host enqueues a batch of steps (its size estimated from the last
+  read back, at most `GPUMaxStepsPerSync`), reads the state back once, and
+  only then rebuilds the cell list or writes an output. Because nothing in
+  the launch sequence of a step changes from step to step, it is captured
+  once as a CUDA graph and replayed (`GPUUseGraph`), which removes most of
+  the per launch overhead that bounds the small 2D cases on Windows.
 * **mDBC on the GPU.** One thread per boundary particle gathers the fluid
   neighbours of its ghost node, assembles the `(D+1)×(D+1)` system in
   registers and solves it with StaticArrays inside the kernel.
@@ -126,6 +150,8 @@ definitions in `benchmark/cases.jl` construct against either package.
 | `GPULanesPerParticle` | `0` (auto) | Warp lanes that share one particle's neighbour loop (1, 2, 4, ... 32). Small cases cannot fill the GPU with one thread per particle, so the automatic choice launches at least four times the resident thread capacity of the device and lets several lanes scan alternating neighbours, combined with warp shuffles. |
 | `GPUBoundaryForces` | `true` | Evaluate the momentum equation for boundary particles too, as the CPU does (their acceleration only enters the force based time step limit). `false` skips it and saves 10-20 % in cases with many boundary particles, at the price of a slightly different adaptive time step. |
 | `GPUAsyncOutput` | `true` | Write output files on a task while the GPU continues. |
+| `GPUMaxStepsPerSync` | `32` | Upper bound on the steps enqueued between two host read backs of the device resident step state. The actual batch is the estimated number of steps until the next cell list rebuild or output. `1` reproduces a synchronization per step. |
+| `GPUUseGraph` | `true` | Capture the launch sequence of a step as a CUDA graph and replay it. Disabled automatically with `GPUSyncTimers`. |
 
 `OutputTimes` also accepts `Float64` values or vectors when `FloatType = Float32`.
 

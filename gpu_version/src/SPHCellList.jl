@@ -9,7 +9,7 @@ written, so the host arrays always hold the most recently written state.
 module SPHCellList
 
 export GPUParticles, GPUSupportArrays, MotionArrays, upload_particles, download_particles!,
-       RunSimulation, SimulationLoop, StepReduction
+       RunSimulation, SimulationLoop, enqueue_step!, batch_size
 
 using CUDA
 using StaticArrays
@@ -32,6 +32,7 @@ using ..SPHKernels
 using ..SPHViscosityModels
 using ..SPHDensityDiffusionModels
 using ..GPUReductions
+using ..GPUStepState
 using ..GPUCellGrid
 using ..GPUKernels
 
@@ -53,7 +54,6 @@ mutable struct GPUParticles{D, T, S}
     Position::CuVector{SVector{D, T}}
     Velocity::CuVector{SVector{D, T}}
     Density::CuVector{T}
-    BoundaryBool::CuVector{UInt8}
     ID::CuVector{Int}
     Type::CuVector{ParticleType}
     GroupMarker::CuVector{UInt}
@@ -65,7 +65,6 @@ mutable struct GPUParticles{D, T, S}
 
     Kernel::CuVector{T}
     KernelGradient::CuVector{SVector{D, T}}
-    ChunkID::CuVector{Int}
 
     scratch::S
 end
@@ -73,8 +72,12 @@ end
 Base.length(p::GPUParticles) = length(p.Position)
 
 const PERSISTENT_FIELDS = (:Position, :Velocity, :Density,
-                           :BoundaryBool, :ID, :Type, :GroupMarker, :GhostPoints, :GhostNormals,
+                           :ID, :Type, :GroupMarker, :GhostPoints, :GhostNormals,
                            :Acceleration, :Pressure)
+
+# Device fields that can be copied back into the host `StructArray`.
+const DOWNLOADABLE_FIELDS = (:Velocity, :Density, :ID, :Type, :GroupMarker, :GhostPoints, :GhostNormals,
+                             :Acceleration, :Pressure, :Kernel, :KernelGradient)
 
 """
     upload_particles(SimParticles::StructArray) -> GPUParticles
@@ -91,7 +94,6 @@ function upload_particles(SimParticles::StructArray)
         Position      = similar(Position),
         Velocity      = CuVector{SVector{D, T}}(undef, n),
         Density       = CuVector{T}(undef, n),
-        BoundaryBool  = CuVector{UInt8}(undef, n),
         ID            = CuVector{Int}(undef, n),
         Type          = CuVector{ParticleType}(undef, n),
         GroupMarker   = CuVector{UInt}(undef, n),
@@ -105,7 +107,6 @@ function upload_particles(SimParticles::StructArray)
         Position,
         CuArray(SimParticles.Velocity),
         CuArray(SimParticles.Density),
-        CuArray(SimParticles.BoundaryBool),
         CuArray(SimParticles.ID),
         CuArray(SimParticles.Type),
         CuArray(SimParticles.GroupMarker),
@@ -116,32 +117,26 @@ function upload_particles(SimParticles::StructArray)
         CUDA.zeros(Int32, n),
         CuArray(SimParticles.Kernel),
         CuArray(SimParticles.KernelGradient),
-        CuArray(SimParticles.ChunkID),
         scratch,
     )
 end
 
 """
-    download_particles!(SimParticles, gpu, grid)
+    download_particles!(SimParticles, gpu, grid, fields = DOWNLOADABLE_FIELDS; cells = false)
 
-Copy the device state back into the host `StructArray`, including the cell of
-every particle as a `CartesianIndex`.
+Copy `Position` and the device fields named in `fields` back into the host
+`StructArray`. Host fields that are not listed are left untouched, so pass
+exactly the fields that are written to the output. With `cells = true` the
+cell of every particle is also stored as a `CartesianIndex`. Returns the cell
+ids as a host vector (empty unless `cells = true`).
 """
-function download_particles!(SimParticles::StructArray, gpu::GPUParticles{D, T}, grid::CellGrid{D}) where {D, T}
-    copyto!(SimParticles.Position,       gpu.Position)
-    copyto!(SimParticles.Velocity,       gpu.Velocity)
-    copyto!(SimParticles.Density,        gpu.Density)
-    copyto!(SimParticles.BoundaryBool,   gpu.BoundaryBool)
-    copyto!(SimParticles.ID,             gpu.ID)
-    copyto!(SimParticles.Type,           gpu.Type)
-    copyto!(SimParticles.GroupMarker,    gpu.GroupMarker)
-    copyto!(SimParticles.GhostPoints,    gpu.GhostPoints)
-    copyto!(SimParticles.GhostNormals,   gpu.GhostNormals)
-    copyto!(SimParticles.Acceleration,   gpu.Acceleration)
-    copyto!(SimParticles.Pressure,       gpu.Pressure)
-    copyto!(SimParticles.Kernel,         gpu.Kernel)
-    copyto!(SimParticles.KernelGradient, gpu.KernelGradient)
-    copyto!(SimParticles.ChunkID,        gpu.ChunkID)
+function download_particles!(SimParticles::StructArray, gpu::GPUParticles{D, T}, grid::CellGrid{D},
+                             fields = DOWNLOADABLE_FIELDS; cells::Bool = false) where {D, T}
+    copyto!(SimParticles.Position, gpu.Position)
+    for f in fields
+        copyto!(getproperty(SimParticles, f), getproperty(gpu, f))
+    end
+    cells || return Int32[]
 
     cid = Array(gpu.CellID)
     @inbounds for i in eachindex(cid)
@@ -218,10 +213,10 @@ end
 function rebuild_cell_list!(gpu::GPUParticles, cl::CellListWorkspace, InverseCutOff)
     s = gpu.scratch
     srcs = (gpu.Position, gpu.Velocity, gpu.Density,
-            gpu.BoundaryBool, gpu.ID, gpu.Type, gpu.GroupMarker, gpu.GhostPoints, gpu.GhostNormals,
+            gpu.ID, gpu.Type, gpu.GroupMarker, gpu.GhostPoints, gpu.GhostNormals,
             gpu.Acceleration, gpu.Pressure, cl.CellIDScratch)
     dsts = (s.Position, s.Velocity, s.Density,
-            s.BoundaryBool, s.ID, s.Type, s.GroupMarker, s.GhostPoints, s.GhostNormals,
+            s.ID, s.Type, s.GroupMarker, s.GhostPoints, s.GhostNormals,
             s.Acceleration, s.Pressure, gpu.CellID)
 
     grid = update_cell_list!(cl, gpu.Position, InverseCutOff, srcs, dsts)
@@ -229,14 +224,13 @@ function rebuild_cell_list!(gpu::GPUParticles, cl::CellListWorkspace, InverseCut
     # Swap the two sets of persistent arrays.
     gpu.scratch = (
         Position = gpu.Position, Velocity = gpu.Velocity, Density = gpu.Density,
-        BoundaryBool = gpu.BoundaryBool, ID = gpu.ID, Type = gpu.Type,
+        ID = gpu.ID, Type = gpu.Type,
         GroupMarker = gpu.GroupMarker, GhostPoints = gpu.GhostPoints, GhostNormals = gpu.GhostNormals,
         Acceleration = gpu.Acceleration, Pressure = gpu.Pressure,
     )
     gpu.Position      = s.Position
     gpu.Velocity      = s.Velocity
     gpu.Density       = s.Density
-    gpu.BoundaryBool  = s.BoundaryBool
     gpu.ID            = s.ID
     gpu.Type          = s.Type
     gpu.GroupMarker   = s.GroupMarker
@@ -246,28 +240,6 @@ function rebuild_cell_list!(gpu::GPUParticles, cl::CellListWorkspace, InverseCut
     gpu.Pressure      = s.Pressure
 
     return grid
-end
-
-#---------------------------------------------------------------
-# Fused per step reduction: time step limits and maximum displacement
-#---------------------------------------------------------------
-
-"""
-    StepReduction(ws, gpu, sup, SimKernel; fused) -> (visc, dt1, maxdisp)
-
-Time step limits and maximum displacement of all particles. After the first
-step the values are produced by the final step kernel of the previous step
-(`fused = true`) and only the per block partial results need to be combined.
-"""
-function StepReduction(ws::ReductionWorkspace{SVector{3, T}}, gpu::GPUParticles{D, T},
-                       sup::GPUSupportArrays{D, T}, SimKernel; fused::Bool = false) where {D, T}
-    init = SVector{3, T}(zero(T), T(Inf), zero(T))
-    if fused
-        return finish_reduction(ws, step_reduce, init)
-    else
-        return reduce_svector(ws, step_map, step_reduce, init, length(gpu), gpu.Position, gpu.Velocity,
-                              gpu.Acceleration, sup.Positionₙ⁺, T(SimKernel.h), T(SimKernel.η²))
-    end
 end
 
 #---------------------------------------------------------------
@@ -282,11 +254,18 @@ function UpdateMetaData!(SimMetaData, dt)
 end
 
 @inline next_output_time(SimMetaData) = next_output_time(SimMetaData.OutputTimes, SimMetaData)
-@inline next_output_time(interval::Real, SimMetaData) = interval * SimMetaData.OutputIterationCounter
+# Deadline for the current output interval. The GPU frame counter is one
+# based because it indexes the writer's file handle vector directly, so
+# `interval * counter` here is the CPU's `interval * (counter + 1)` with its
+# zero based counter. The deadline is clamped to the simulation end so the
+# last interval never overshoots `SimulationTime` by up to one interval.
+@inline function next_output_time(interval::Real, SimMetaData)
+    return min(interval * SimMetaData.OutputIterationCounter, SimMetaData.SimulationTime)
+end
 @inline function next_output_time(times::AbstractVector, SimMetaData)
     idx = SimMetaData.OutputIterationCounter
-    if idx < length(times)
-        return times[idx]
+    if idx <= length(times)
+        return min(times[idx], SimMetaData.SimulationTime)
     else
         return SimMetaData.SimulationTime
     end
@@ -294,18 +273,179 @@ end
 
 @inline maybe_sync(SimMetaData) = (SimMetaData.GPUSyncTimers && CUDA.synchronize(); nothing)
 
+#---------------------------------------------------------------
+# Launch sequence of one time step
+#---------------------------------------------------------------
+
+# Time a phase (and wait for the GPU) only when `timed` is set; otherwise
+# just enqueue it, so that the same code can be captured into a graph.
+macro phase(hg, name, timed, ex)
+    quote
+        if $(esc(timed))
+            TimerOutputs.@timeit $(esc(hg)) $(esc(name)) begin
+                $(esc(ex))
+                CUDA.synchronize()
+            end
+        else
+            $(esc(ex))
+        end
+    end
+end
+
+"""
+    enqueue_step!(ctx, timed)
+
+Enqueue every kernel of one time step. Nothing in here reads the device:
+the time step and the time are taken from `ctx.state` by the kernels, the
+grid from `ctx.cl.grid_dev`, and every kernel exits at once when the device
+side stop flag is set. The sequence is therefore identical from step to step
+and can be captured as a CUDA graph (`launch_step_graph!`). With `timed`
+every phase is followed by a synchronization and timed separately.
+"""
+function enqueue_step!(ctx, timed::Bool)
+    (; gpu, cl, sup, red, motion, state, SimKernel, SimConstants, SimDensityDiffusion, SimViscosity,
+       FlagKernel, FlagShift, UseMDBC, SingleNeighbor, threads, lanes, bforces, HourGlass) = ctx
+    grid      = cl.grid_dev
+    CellStart = cl.CellStart
+
+    # dt of this step from the reduction of the previous one; also decides
+    # whether the step may run at all (cell list rebuild, output time).
+    @phase HourGlass "01 Update TimeStep" timed launch_finish!(state, red, SimKernel, SimConstants)
+
+    # The pressure of the start-of-step density was already computed by the
+    # final kernel of the previous step (and on the host before the first).
+    if motion.active
+        @phase HourGlass "Motion" timed launch_motion!(gpu.Position, gpu.Velocity, gpu.Type, gpu.GroupMarker,
+                                                       motion, state)
+    end
+
+    if !SingleNeighbor
+        if UseMDBC
+            @phase HourGlass "04a First NeighborLoopMDBC" timed launch_mdbc!(
+                gpu.Density, gpu.Position, gpu.GhostPoints, gpu.Type, CellStart, grid, state,
+                SimKernel, SimConstants; threads = threads, lanes = lanes)
+        end
+
+        @phase HourGlass "04 First NeighborLoop" timed begin
+            launch_inv_density!(sup.InvDensity, gpu.Density, state)
+            launch_interactions!(sup.dρdtI, gpu.Acceleration, gpu.Kernel, gpu.KernelGradient, sup.∇Cᵢ, sup.∇◌rᵢ,
+                                 gpu.Position, gpu.Density, sup.InvDensity, gpu.Pressure,
+                                 gpu.Velocity, gpu.Type, CellStart, gpu.CellID, grid, state,
+                                 SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
+                                 FlagKernel, FlagShift; threads = threads, lanes = lanes,
+                                 boundary_forces = bforces)
+        end
+    end
+
+    @phase HourGlass "05b Update To Half TimeStep" timed launch_half_step!(
+        sup.Positionₙ⁺, sup.Velocityₙ⁺, sup.ρₙ⁺, sup.InvDensityₙ⁺, gpu.Pressure,
+        gpu.Position, gpu.Velocity, gpu.Acceleration, gpu.Density, sup.dρdtI,
+        gpu.Type, gpu.GroupMarker, motion, state, SimConstants)
+
+    # Corrector: every term, including the viscosity and density diffusion
+    # models, is evaluated at the predictor state.
+    @phase HourGlass "08 Second NeighborLoop" timed launch_interactions!(
+        sup.dρdtI, gpu.Acceleration, gpu.Kernel, gpu.KernelGradient, sup.∇Cᵢ, sup.∇◌rᵢ,
+        sup.Positionₙ⁺, sup.ρₙ⁺, sup.InvDensityₙ⁺, gpu.Pressure,
+        sup.Velocityₙ⁺, gpu.Type, CellStart, gpu.CellID, grid, state,
+        SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
+        FlagKernel, FlagShift; threads = threads, lanes = lanes,
+        boundary_forces = bforces)
+
+    @phase HourGlass "11 Update To Final TimeStep" timed launch_final_step!(
+        gpu.Position, gpu.Velocity, gpu.Acceleration, gpu.Density, gpu.Pressure,
+        sup.dρdtI, sup.ρₙ⁺, sup.Positionₙ⁺, sup.Velocityₙ⁺, gpu.Type,
+        sup.∇Cᵢ, sup.∇◌rᵢ, state, SimKernel, SimConstants, red, FlagShift)
+
+    @phase HourGlass "12 Update MetaData" timed launch_commit!(state)
+    return nothing
+end
+
+"""
+    launch_step_graph!(ctx)
+
+Replay the launch sequence of a step as a CUDA graph. The graph bakes in the
+device pointers of its arguments, and the persistent particle arrays are
+swapped with their scratch copies at every cell list rebuild, so one graph
+is kept per set of pointers (normally two, keyed by the position array and
+the reallocation generation of the cell list). The first call for a key
+captures and instantiates the graph; a capture that fails (kernels that
+still have to be compiled) falls back to direct launches for that step.
+"""
+function launch_step_graph!(ctx)
+    state = ctx.state
+    key   = (UInt(pointer(ctx.gpu.Position)), ctx.cl.generation)
+    exec  = get(state.graphs, key, nothing)
+    if exec === nothing
+        graph = CUDA.capture(() -> enqueue_step!(ctx, false); throw_error = false)
+        if graph === nothing
+            enqueue_step!(ctx, false)
+            return nothing
+        end
+        exec = CUDA.instantiate(graph)
+        state.graphs[key] = exec
+    end
+    CUDA.launch(exec)
+    return nothing
+end
+
+"""
+    batch_size(state, h, t_out, kmax) -> K
+
+Number of steps to enqueue before the next host read back: the estimated
+number of steps until the cell list must be rebuilt or the output time is
+reached (from the last read back), plus one so that the device rather than
+the host makes the final decision, capped by `kmax`. Steps enqueued beyond
+the device side stop are no-ops.
+"""
+function batch_size(state::StepState{T}, h, t_out, kmax::Int) where {T}
+    kmax <= 1 && return 1
+    fh = state.fh
+    dx = fh[F_DX]
+    dx >= h && return 1                        # a rebuild is already due
+    d4 = fh[F_DISP]
+    dt = fh[F_DT]
+    est_rebuild = d4 > zero(T) ? (h - dx) / d4 : T(Inf)
+    est_output  = dt > zero(T) ? (T(t_out) - fh[F_TIME]) / dt : T(Inf)
+    est = min(est_rebuild, est_output)
+    isfinite(est) || return kmax
+    return clamp(floor(Int, est) + 1, 1, kmax)
+end
+
+# Mirror the device state into the meta data after a read back.
+function sync_meta_data!(SimMetaData, state::StepState)
+    SimMetaData.Iteration = Int(state.ih[I_ITER])
+    SimMetaData.TotalTime = state.fh[F_TIME]
+    if state.ih[I_PHASE] == PHASE_NEED_DT
+        # otherwise `dt` belongs to the step that still has to run
+        SimMetaData.CurrentTimeStep = state.fh[F_DT]
+    end
+    return nothing
+end
+
+#---------------------------------------------------------------
+# Time loop
+#---------------------------------------------------------------
+
 """
 Advance the simulation on the GPU until the next output time. Mirrors the CPU
 `SimulationLoop` step for step; see `GPUKernels` for the fused kernels.
+
+The host enqueues batches of steps (`batch_size`) and reads the device
+resident step state back once per batch (`GPUStepState`). The device decides
+when the cell list has to be rebuilt and when the output time is reached; the
+host reacts to the read back state by rebuilding (`rebuild_cell_list!`) or
+returning. With `GPUUseGraph` a step is replayed as a CUDA graph.
+`GPUSyncTimers` forces one step per batch with a synchronization after every
+phase so that the timer output is meaningful.
 """
 function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
                         SimMetaData::SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode},
                         SimConstants, gpu::GPUParticles{Dimensions, FloatType},
                         cl::CellListWorkspace, sup::GPUSupportArrays, red::ReductionWorkspace,
-                        motion) where {Dimensions, FloatType, SMode, KMode, BMode, LMode,
-                                       SDD <: SPHDensityDiffusion, SV <: SPHViscosity}
+                        motion, state::StepState{FloatType}) where {Dimensions, FloatType, SMode, KMode, BMode, LMode,
+                                                                    SDD <: SPHDensityDiffusion, SV <: SPHViscosity}
     HourGlass = SimMetaData.HourGlass
-    (; CFL, c₀) = SimConstants
     h = SimKernel.h
 
     # The mode type parameters of the meta data select the kernel variants at
@@ -320,97 +460,55 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
     lanes      = Val(nlanes <= 0 ? choose_lanes(length(gpu)) : nlanes)
     bforces    = Val(SimMetaData.GPUBoundaryForces)
 
-    Δx = one(FloatType) + h
+    timed     = SimMetaData.GPUSyncTimers
+    use_graph = SimMetaData.GPUUseGraph && !timed
+    kmax      = timed ? 1 : max(1, SimMetaData.GPUMaxStepsPerSync)
 
-    # The reduction of the previous step's final kernel is only available
-    # after at least one step has been taken.
-    fused_reduction = SimMetaData.Iteration > 0
+    ctx = (; gpu, cl, sup, red, motion, state, SimKernel, SimConstants, SimDensityDiffusion, SimViscosity,
+             FlagKernel, FlagShift, UseMDBC, SingleNeighbor, threads, lanes, bforces, HourGlass)
 
-    while SimMetaData.TotalTime <= next_output_time(SimMetaData)
+    t_out = next_output_time(SimMetaData)
+    set_output_time!(state, t_out)
 
-        @timeit HourGlass "01 Update TimeStep" begin
-            r    = StepReduction(red, gpu, sup, SimKernel; fused = fused_reduction)
-            Δx  += 4 * r[3]
-            visc = r[1]
-            dt1  = r[2]
-            dt   = CFL * min(dt1, h / (c₀ + visc))
+    if !state.primed
+        # No final step kernel has run yet: reduce the initial state for the
+        # first time step. (`Positionₙ⁺` is still zero, so the displacement
+        # term is meaningless, but the initial displacement bound already
+        # forces a cell list rebuild before the first step.)
+        launch_step_reduction!(red, gpu.Position, gpu.Velocity, gpu.Acceleration, sup.Positionₙ⁺, SimKernel)
+        state.primed = true
+    end
+
+    generation = cl.generation
+    while true
+        K = batch_size(state, h, t_out, kmax)
+        @timeit HourGlass "03 Launch Steps" for _ in 1:K
+            if use_graph
+                launch_step_graph!(ctx)
+            else
+                enqueue_step!(ctx, timed)
+            end
         end
-        dt₂ = dt / 2
 
-        @timeit HourGlass "02 Calculate IndexCounter" begin
-            if Δx >= h
-                @timeit HourGlass "02a Actual Calculate IndexCounter" begin
-                    rebuild_cell_list!(gpu, cl, SimKernel.H⁻¹)
-                    maybe_sync(SimMetaData)
+        @timeit HourGlass "13 Read Back State" begin
+            readback!(state)
+            sync_meta_data!(SimMetaData, state)
+        end
+
+        stop = state.ih[I_STOP]
+        if stop == STOP_REBUILD
+            @timeit HourGlass "02a Actual Calculate IndexCounter" begin
+                rebuild_cell_list!(gpu, cl, SimKernel.H⁻¹)
+                if cl.generation != generation
+                    # the cell start buffer was reallocated: cached graphs point at the old one
+                    invalidate_graphs!(state)
+                    generation = cl.generation
                 end
-                Δx = zero(FloatType)
+                resume_after_rebuild!(state)
             end
+        elseif stop == STOP_OUTPUT || SimMetaData.TotalTime > t_out
+            break
         end
-        grid      = cl.grid
-        CellStart = cl.CellStart
-
-        # The pressure of the start-of-step density was already computed by the
-        # final kernel of the previous step (and on the host before the first).
-        if motion.active
-            @timeit HourGlass "Motion" begin
-                launch_motion!(gpu.Position, gpu.Velocity, gpu.Type, gpu.GroupMarker, motion, dt₂,
-                               SimMetaData.TotalTime)
-                maybe_sync(SimMetaData)
-            end
-        end
-
-        if !SingleNeighbor
-            if UseMDBC
-                @timeit HourGlass "04a First NeighborLoopMDBC" begin
-                    launch_mdbc!(gpu.Density, gpu.Position, gpu.GhostPoints, gpu.Type, CellStart, grid,
-                                 SimKernel, SimConstants; threads = threads, lanes = lanes)
-                    maybe_sync(SimMetaData)
-                end
-            end
-
-            @timeit HourGlass "04 First NeighborLoop" begin
-                # Reciprocal of the start-of-step density (after the mDBC correction
-                # and any reordering by the cell list rebuild).
-                sup.InvDensity .= inv.(gpu.Density)
-                launch_interactions!(sup.dρdtI, gpu.Acceleration, gpu.Kernel, gpu.KernelGradient, sup.∇Cᵢ, sup.∇◌rᵢ,
-                                     gpu.ChunkID, gpu.Position, gpu.Density, sup.InvDensity, gpu.Pressure,
-                                     gpu.Velocity, gpu.Type, CellStart, gpu.CellID, grid,
-                                     SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
-                                     FlagKernel, FlagShift; threads = threads, lanes = lanes,
-                                     boundary_forces = bforces)
-                maybe_sync(SimMetaData)
-            end
-        end
-
-        @timeit HourGlass "05b Update To Half TimeStep" begin
-            launch_half_step!(sup.Positionₙ⁺, sup.Velocityₙ⁺, sup.ρₙ⁺, sup.InvDensityₙ⁺, gpu.Pressure,
-                              gpu.Position, gpu.Velocity, gpu.Acceleration, gpu.Density, sup.dρdtI,
-                              gpu.Type, gpu.GroupMarker, motion,
-                              dt₂, SimMetaData.TotalTime, SimConstants)
-            maybe_sync(SimMetaData)
-        end
-
-        @timeit HourGlass "08 Second NeighborLoop" begin
-            # Corrector: every term, including the viscosity and density diffusion
-            # models, is evaluated at the predictor state.
-            launch_interactions!(sup.dρdtI, gpu.Acceleration, gpu.Kernel, gpu.KernelGradient, sup.∇Cᵢ, sup.∇◌rᵢ,
-                                 gpu.ChunkID, sup.Positionₙ⁺, sup.ρₙ⁺, sup.InvDensityₙ⁺, gpu.Pressure,
-                                 sup.Velocityₙ⁺, gpu.Type, CellStart, gpu.CellID, grid,
-                                 SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
-                                 FlagKernel, FlagShift; threads = threads, lanes = lanes,
-                                 boundary_forces = bforces)
-            maybe_sync(SimMetaData)
-        end
-
-        @timeit HourGlass "11 Update To Final TimeStep" begin
-            launch_final_step!(gpu.Position, gpu.Velocity, gpu.Acceleration, gpu.Density, gpu.Pressure,
-                               sup.dρdtI, sup.ρₙ⁺, sup.Positionₙ⁺, sup.Velocityₙ⁺, gpu.Type,
-                               sup.∇Cᵢ, sup.∇◌rᵢ, dt, SimKernel, SimConstants, red, FlagShift)
-            maybe_sync(SimMetaData)
-        end
-        fused_reduction = true
-
-        @timeit HourGlass "12 Update MetaData" UpdateMetaData!(SimMetaData, dt)
     end
 
     return nothing
@@ -451,6 +549,11 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
     SimMetaData.TimeSteppingMode = SimTimeStepping
     StoreLogOutput = LMode === StoreLog
 
+    # Only the fields that end up in the output files are copied back from the
+    # GPU at every output; the host arrays of the other fields stay untouched.
+    output_vars     = resolve_output_variables!(SimMetaData)
+    download_fields = Tuple(Symbol.(output_vars))
+
     TimeSteps = Vector{FloatType}()
 
     if BMode === SimpleMDBC
@@ -488,6 +591,10 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
         cl     = CellListWorkspace{Dimensions, FloatType}(NumberOfPoints;
                      max_cells = SimMetaData.GPUMaxCells, deterministic = SimMetaData.GPUDeterministicSort)
         motion = MotionArrays(SimGeometry, SimParticles)
+        # Device resident loop state. The displacement bound starts above `h`
+        # so that the cell list is built before the first step.
+        state  = StepState{FloatType}(; time = SimMetaData.TotalTime, iteration = SimMetaData.Iteration,
+                                        dx = one(FloatType) + SimKernel.h)
         CUDA.synchronize()
     end
 
@@ -526,7 +633,7 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
 
     while true
         @timeit HourGlass "00 SimulationLoop" SimulationLoop(SimDensityDiffusion, SimViscosity, SimKernel, SimMetaData,
-                                                             SimConstants, gpu, cl, sup, red, motion)
+                                                             SimConstants, gpu, cl, sup, red, motion, state)
         push!(TimeSteps, SimMetaData.CurrentTimeStep)
 
         if StoreLogOutput
@@ -538,7 +645,8 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
 
         @timeit HourGlass "13 Download From GPU" begin
             wait_for_output()
-            cid = download_particles!(SimParticles, gpu, cl.grid)
+            cid = download_particles!(SimParticles, gpu, cl.grid, download_fields;
+                                      cells = SimMetaData.ExportGridCells)
         end
 
         UniqueCells = SimMetaData.ExportGridCells ? unique_cells_host(cl.grid, cid) : CartesianIndex{Dimensions}[]
@@ -573,6 +681,10 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
                 output.close_files()
             end
 
+            # Leave the complete final state on the host, not only the output
+            # fields, so that callers can inspect every particle field.
+            @timeit HourGlass "13 Download From GPU" download_particles!(SimParticles, gpu, cl.grid; cells = true)
+
             if !SimLogger.ToConsole
                 finish!(SimMetaData.ProgressSpecification)
             end
@@ -587,6 +699,8 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
             if StoreLogOutput
                 with_logger(SimLogger.Logger) do
                     @info "Cell list rebuilds: $(cl.nrebuilds), grid dims: $(cl.grid.dims)"
+                    @info "Host read backs of the step state: $(state.readbacks) for $(SimMetaData.Iteration) steps, " *
+                          "captured step graphs: $(length(state.graphs))"
                     @info @sprintf("Asynchronous output write time (overlapped with GPU work): %.2f [s]", async_write_time)
                 end
                 LogFinal(SimLogger, HourGlass)

@@ -82,11 +82,63 @@ the standard *gather* formulation:
   A histogram (atomics), a prefix scan and a scatter reorder all particle
   arrays by cell in a single fused gather kernel; the three cells of one row
   form one contiguous index range so a 3D particle scans 9 ranges instead of
-  27 cells. The reorder is followed by an in-cell insertion sort, which makes
+  27 cells. `GPUCellSubdivision = 2` bins at `H/2` with a 5x5(x5) stencil
+  instead (25 row ranges in 3D), which scans 42 % less volume in 3D and 31 %
+  in 2D; see the next point for what that buys. The reorder is followed by an in-cell insertion sort, which makes
   runs bitwise reproducible (`GPUDeterministicSort = false` skips it). The
   cell list is only rebuilt when the accumulated displacement exceeds `h`,
   exactly like the CPU version. Gravity and motion factors are derived from
   particle type instead of stored or reordered as separate arrays.
+* **Half width cells (`GPUCellSubdivision = 2`).** Candidates per particle
+  drop from 30.5 to 21.8 (DamBreak2D), 34.3 to 23.7 (MovingSquare2D), 520 to
+  322 (DamBreak3D) and 262 to 159 (Duckling3D); the share of candidates
+  inside the support rises from 20-31 % to 32-46 %. The pairs found are the
+  same (tested with the density diffusion off, where every term is
+  antisymmetric: both grids agree to 1e-14). The price is 25 instead of 9 row
+  ranges per particle in 3D (iterated lazily; a 25-tuple would unroll the
+  pair body 25 times), a grid with 4-8 times more cells, and an mDBC kernel
+  that visits the fluid ranges of 125 instead of 27 cells. Measured on an RTX
+  A1000 (Float32, device time per step, 9 interleaved rounds, median ratio to
+  `GPUCellSubdivision = 1`): with one lane per particle the pair kernel takes
+  0.84 (DamBreak2D mDBC), 0.73 (MovingSquare2D), 0.77 (DamBreak3D), 0.65
+  (Duckling3D mDBC) and the whole step 0.94, 0.76, 0.77, 0.73. With the
+  automatic lane split of the small cases (32, 4, 8, 4 lanes) the pair kernel
+  takes 1.41, 0.85, 0.94, 0.81 and the step 1.33, 0.87, 0.93, 0.94: the lanes
+  stride each of the 25 short row ranges separately, and the mDBC kernel
+  time roughly doubles. The default therefore stays 1, the grid whose pair
+  orientation reproduces the CPU results; use 2 for large cases that run with
+  one lane per particle. Splitting the rows rather than the candidates of a
+  row over the lanes, and merging the fluid ranges of a row in the mDBC
+  kernel, are the obvious follow ups. A full run of the 3D dam break at
+  `dp = 0.0085` (1.6 s simulated, `GPUCellSubdivision = 2`,
+  `GPULanesPerParticle = 1`) finished 40 s sooner than with the `H` grid.
+* **Lanes per particle (`GPULanesPerParticle`).** With one lane, particle
+  `i` gets thread `i`, and that thread visits every candidate itself. With
+  `K` lanes, particle `i` gets `K` consecutive threads of a warp instead:
+  lane `k` starts at candidate `k` of each row range and steps by `K`, so the
+  `K` lanes together visit every candidate exactly once, each accumulating
+  its own partial sums. At the end the partial sums are merged across the
+  lanes with warp shuffles (`lanes_sum`) and lane 0 writes the result; the
+  mDBC kernel does the same for its ghost node matrix. The option exists
+  because a small case has too few particles to fill the GPU: an RTX A1000
+  holds roughly 16 000 resident threads per pass, so a 3 000 particle 2D
+  case with one lane leaves most of the chip idle. The automatic choice
+  (`0`) picks `K` such that at least four times the resident thread capacity
+  is launched, which gives 32 lanes to a 6 700 particle 2D case, 4 to a
+  55 000 particle 3D case and 1 above roughly 100 000 particles. Lanes
+  interact badly with half width cells: they stride within one row range and
+  only finish together when the range holds many candidates. With `H/2`
+  cells there are 25 rows per particle, each about five times shorter, so
+  lanes sit idle while the loop overhead is paid 25 times instead of 9 (the
+  1.41 above). Even on the `H` grid, 32 lanes took 2.6 times the device time
+  of 1 lane on the pair kernel of the 6 700 particle 2D dam break; many lanes
+  only help when the GPU would otherwise be idle, and they cost real work in
+  shuffles and duplicated loop control. The heuristic was tuned on wall time
+  on Windows, where launch overhead dominates the small cases, so device
+  time alone is not the whole picture, but a sweep with `benchmark/tune.jl`
+  on the small cases is worth doing. Rule of thumb: large cases run with 1
+  lane and `GPUCellSubdivision = 2`; small cases keep both defaults unless
+  measured otherwise.
 * **Fused element-wise kernels.** Half step, density limiting, prescribed
   motion and pressure are one kernel; the final step also computes the
   pressure for the next step and the block wise reduction of the time step
@@ -135,7 +187,12 @@ selects all defaults. `RunSimulation` takes the time stepping scheme as
 `SimTimeStepping`: `SymplecticTimeStepping()` evaluates two neighbour loops per
 step and is the scheme validated against the CPU; `SingleNeighborTimeStepping()`
 reuses the corrector derivative of the previous step as the next predictor and
-evaluates one neighbour loop per step. Because both packages share these types
+evaluates one neighbour loop per step. Like the CPU scheme it applies the mDBC
+correction (with `SimpleMDBC`) to the boundary densities before every half
+step, and it evaluates the derivative at the accepted full state (mDBC,
+pressure, neighbour loop) before the first step and after every cell list
+rebuild. Unlike the CPU it does not re-evaluate the carried derivative every
+20 steps. Because both packages share these types
 and the `AllocateDataStructures(SimGeometry, SimMetaData)` form, the case
 definitions in `benchmark/cases.jl` construct against either package.
 
@@ -147,11 +204,12 @@ definitions in `benchmark/cases.jl` construct against either package.
 | `GPUDeterministicSort` | `true` | Sort particles inside each cell after the counting sort; results become bitwise reproducible between runs. |
 | `GPUMaxCells` | `50_000_000` | Abort with a clear message if the neighbour grid would need more cells (a particle escaped). |
 | `GPUInteractionThreads` | `128` | Threads per block of the interaction and mDBC kernels. |
-| `GPULanesPerParticle` | `0` (auto) | Warp lanes that share one particle's neighbour loop (1, 2, 4, ... 32). Small cases cannot fill the GPU with one thread per particle, so the automatic choice launches at least four times the resident thread capacity of the device and lets several lanes scan alternating neighbours, combined with warp shuffles. |
+| `GPULanesPerParticle` | `0` (auto) | Warp lanes that share one particle's neighbour loop (1, 2, 4, ... 32). Small cases cannot fill the GPU with one thread per particle, so the automatic choice launches at least four times the resident thread capacity of the device and lets several lanes scan alternating neighbours, combined with warp shuffles. Use `1` for large cases and together with `GPUCellSubdivision = 2` (see "Lanes per particle" above). |
 | `GPUBoundaryForces` | `true` | Evaluate the momentum equation for boundary particles too, as the CPU does (their acceleration only enters the force based time step limit). `false` skips it and saves 10-20 % in cases with many boundary particles, at the price of a slightly different adaptive time step. |
 | `GPUAsyncOutput` | `true` | Write output files on a task while the GPU continues. |
 | `GPUMaxStepsPerSync` | `32` | Upper bound on the steps enqueued between two host read backs of the device resident step state. The actual batch is the estimated number of steps until the next cell list rebuild or output. `1` reproduces a synchronization per step. |
 | `GPUUseGraph` | `true` | Capture the launch sequence of a step as a CUDA graph and replay it. Disabled automatically with `GPUSyncTimers`. |
+| `GPUCellSubdivision` | `1` | Cells per support radius `H` along each axis: `1` bins at `H` with a 3^D stencil (the CPU's cells), `2` at `H/2` with a 5^D stencil. Same neighbour pairs, fewer distance checks, more cell ranges per particle. Only `1` reproduces the CPU's orientation of the asymmetric density diffusion term (the results of the two grids differ by that term only). `2` pays off with one lane per particle (large cases); with many lanes it is slower. |
 
 `OutputTimes` also accepts `Float64` values or vectors when `FloatType = Float32`.
 

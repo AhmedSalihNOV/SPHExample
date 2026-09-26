@@ -25,7 +25,6 @@ module GPUKernels
 using CUDA
 using StaticArrays
 using LinearAlgebra
-using FastPow
 
 using ..SPHKernels
 using ..SPHViscosityModels
@@ -176,9 +175,9 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
                     xᵢⱼ  = xᵢ - Position[j]
                     xᵢⱼ² = dot(xᵢⱼ, xᵢⱼ)
                     if xᵢⱼ² <= H²
-                        dᵢⱼ   = sqrt(abs(xᵢⱼ²))
-                        q     = clamp(dᵢⱼ * h⁻¹, zero(T), T(2))
-                        ∇ᵢWᵢⱼ = @fastpow ∇Wᵢⱼ(SimKernel, q, xᵢⱼ)
+                        dᵢⱼ   = sqrt(xᵢⱼ²)
+                        q     = dᵢⱼ * h⁻¹ # in [0, 2]: the guard above enforces xᵢⱼ² <= H² = (2h)²
+                        ∇ᵢWᵢⱼ = ∇Wᵢⱼ(SimKernel, q, xᵢⱼ)
 
                         ρⱼ   = Density[j]
                         ρⱼ⁻¹ = InvDensity[j]
@@ -220,7 +219,7 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
                         end
 
                         if FlagKernel
-                            Wsum  += @fastpow SPHKernels.Wᵢⱼ(SimKernel, q)
+                            Wsum  += SPHKernels.Wᵢⱼ(SimKernel, q)
                             ∇Wsum += ∇ᵢWᵢⱼ
                         end
 
@@ -317,12 +316,12 @@ end
             xᵢⱼ  = gp - Position[j]
             xᵢⱼ² = dot(xᵢⱼ, xᵢⱼ)
             if xᵢⱼ² <= H²
-                dᵢⱼ = sqrt(abs(xᵢⱼ²))
-                q   = clamp(dᵢⱼ * h⁻¹, zero(T), T(2))
+                dᵢⱼ = sqrt(xᵢⱼ²)
+                q   = dᵢⱼ * h⁻¹ # in [0, 2]: the guard above enforces xᵢⱼ² <= H² = (2h)²
                 ρⱼ  = Density[j]
 
-                Wᵢⱼ   = @fastpow SPHKernels.Wᵢⱼ(SimKernel, q)
-                ∇ᵢWᵢⱼ = @fastpow ∇Wᵢⱼ(SimKernel, q, xᵢⱼ)
+                Wᵢⱼ   = SPHKernels.Wᵢⱼ(SimKernel, q)
+                ∇ᵢWᵢⱼ = ∇Wᵢⱼ(SimKernel, q, xᵢⱼ)
 
                 Vⱼ    = m₀ / ρⱼ
                 VⱼWᵢⱼ = Vⱼ * Wᵢⱼ

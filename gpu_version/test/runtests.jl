@@ -83,6 +83,32 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
         @test hasproperty(particles, :GhostPoints)
     end
 
+    @testset "output schedule is clamped to the simulation end" begin
+        save = mktempdir()
+        meta = SimulationMetaData{2, Float64}(SimulationName = "m", SaveLocation = save,
+                                              SimulationTime = 0.25, OutputTimes = 0.1,
+                                              OutputIterationCounter = 1)
+        # one based frame counter: frame 1 is the initial state at t = 0
+        @test SPHExampleGPU.SPHCellList.next_output_time(meta) == 0.1
+        meta.OutputIterationCounter = 2
+        @test SPHExampleGPU.SPHCellList.next_output_time(meta) == 0.2
+        # the last interval ends at the simulation end, not at 0.3
+        meta.OutputIterationCounter = 3
+        @test SPHExampleGPU.SPHCellList.next_output_time(meta) == 0.25
+        meta.OutputIterationCounter = 4
+        @test SPHExampleGPU.SPHCellList.next_output_time(meta) == 0.25
+        meta.OutputTimes = [0.1, 0.2]
+        meta.OutputIterationCounter = 1
+        @test SPHExampleGPU.SPHCellList.next_output_time(meta) == 0.1
+        meta.OutputIterationCounter = 2
+        @test SPHExampleGPU.SPHCellList.next_output_time(meta) == 0.2
+        meta.OutputIterationCounter = 3
+        @test SPHExampleGPU.SPHCellList.next_output_time(meta) == 0.25
+        meta.OutputTimes = [0.5]
+        meta.OutputIterationCounter = 1
+        @test SPHExampleGPU.SPHCellList.next_output_time(meta) == 0.25
+    end
+
     @testset "type-derived factors" begin
         for T in (Float32, Float64)
             for (type, gravity, limiter) in ((Fluid, -1, 1), (Fixed, 0, 0),
@@ -91,6 +117,54 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
                 @test MotionLimiterValue(T, type) === T(limiter)
             end
         end
+    end
+
+    @testset "output variables are validated against the modes" begin
+        save = mktempdir()
+        meta = SimulationMetaData{2, Float32}(SimulationName = "m", SaveLocation = save,
+                                              OutputVariables = ["Kernel", "Density", "GhostPoints", "Density"])
+        kept = @test_logs (:warn, r"Kernel") (:warn, r"GhostPoints") resolve_output_variables!(meta)
+        @test kept == ["Density"]
+        @test meta.OutputVariables == ["Density"]
+        meta = SimulationMetaData{2, Float32}(SimulationName = "m", SaveLocation = save, OutputVariables = ["ChunkID"])
+        @test_throws ErrorException resolve_output_variables!(meta)
+        meta = SimulationMetaData{2, Float32, NoShifting, StoreKernelOutput, SimpleMDBC}(
+            SimulationName = "m", SaveLocation = save, OutputVariables = ["Kernel", "GhostNormals", "Acceleration"])
+        @test resolve_output_variables!(meta) == ["Kernel", "GhostNormals", "Acceleration"]
+        @test DEFAULT_OUTPUT_VARIABLES == ["Velocity", "Density", "Pressure", "ID", "Type", "GroupMarker"]
+    end
+
+    @testset "only the requested variables are written" begin
+        case = BENCH_CASES[findfirst(c -> c.name == "StillWedge2D_MDBC_dp0.02", BENCH_CASES)]
+        save = mktempdir()
+        kw   = case.build(Float32, save)
+        meta = kw.SimMetaData
+        meta.SimulationTime  = 0.004f0
+        meta.OutputTimes     = 0.002f0
+        meta.ExportGridCells = true
+        meta.OutputVariables = ["Density", "Velocity", "ID", "Acceleration", "GhostPoints", "Kernel"]
+        particles = AllocateDataStructures(kw.SimGeometry, meta)
+        logger    = SimulationLogger(save; to_console = false)
+        RunSimulation(; kw..., SimLogger = logger, SimParticles = particles)
+        kernel_mode = meta isa SimulationMetaData{2, Float32, S, StoreKernelOutput} where {S}
+        expected = kernel_mode ? ["Density", "Velocity", "ID", "Acceleration", "GhostPoints", "Kernel"] :
+                                 ["Density", "Velocity", "ID", "Acceleration", "GhostPoints"]
+        @test meta.OutputVariables == expected
+        n = length(particles)
+        h5open(joinpath(save, meta.SimulationName * ".vtkhdf"), "r") do fid
+            pd = fid["VTKHDF"]["PointData"]
+            @test sort(keys(pd)) == sort(expected)
+            @test size(pd["Velocity"]) == (3, 3n)        # 2D widened to 3 components, 3 frames
+            @test size(pd["GhostPoints"]) == (3, 3n)
+            @test length(pd["Density"]) == 3n
+            @test any(!iszero, read(pd["GhostPoints"]))  # ghost data of the boundary particles
+        end
+        h5open(joinpath(save, meta.SimulationName * "_GridCells.vtkhdf"), "r") do fid
+            @test keys(fid["VTKHDF"]["CellData"]) == ["CellData"]
+        end
+        # the complete final state is on the host, including fields not written
+        @test all(isfinite, particles.Pressure)
+        @test length(unique(particles.ID)) == n
     end
 
     @testset "cell grid helpers" begin
@@ -135,7 +209,11 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
         @test all(isfinite, particles.Density)
         @test !hasproperty(particles, :GravityFactor)
         @test !hasproperty(particles, :MotionLimiter)
-        @test particles.BoundaryBool == UInt8.(particles.Type .!= Fluid)
+        # derived or diagnostic-only fields are neither stored nor written
+        @test !hasproperty(device, :BoundaryBool)
+        @test !hasproperty(device, :ChunkID)
+        @test !hasproperty(particles, :BoundaryBool)
+        @test !hasproperty(particles, :ChunkID)
     end
 
     @testset "deterministic repeat" begin
@@ -190,7 +268,7 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
             dC  = CuArray(∇Cᵢ);           dr  = CuArray(∇◌rᵢ)
             red = ReductionWorkspace{SVector{3, T}}(n)
             launch_final_step!(dP, dV, dA, dρ, dPr, ddρ, dρn, dPn, dVn, dty, dC, dr,
-                               dt, kern, consts, red, Val(FlagShift))
+                               HostStep(dt, zero(T)), kern, consts, red, Val(FlagShift))
             xg = Array(dP)
             vg = Array(dV)
 
@@ -219,6 +297,109 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
         end
     end
 
+    @testset "device resident step state" begin
+        # The finish kernel must reproduce the host formula for `dt` and the
+        # displacement bookkeeping exactly, and the stop flag has to gate
+        # every kernel of a step.
+        S = SPHExampleGPU.GPUStepState
+        T = Float64
+        consts = SimulationConstants{T}(dx = 0.02, c₀ = 42.0, δᵩ = 0.1, CFL = 0.5)
+        kern   = SPHKernelInstance{2, T}(WendlandC2(); dx = consts.dx)
+        h      = kern.h
+        red    = ReductionWorkspace{SVector{3, T}}(100_000)
+        @test red.nblocks > 1
+        partials = [SVector{3, T}(rand(), 1 + rand(), 0.2 * rand()) for _ in 1:red.nblocks]
+        partials[min(7, red.nblocks)] = SVector{3, T}(3.0, 0.5, 0.25)   # extrema of all three components
+        copyto!(red.partial, partials)
+        visc, dt1, disp = 3.0, 0.5, 0.25
+        dt_ref = consts.CFL * min(dt1, h / (consts.c₀ + visc))
+
+        st = StepState{T}(; time = 0.0, dx = 0.0)
+        S.set_output_time!(st, 1.0)
+        launch_finish!(st, red, kern, consts)
+        readback!(st)
+        @test st.fh[S.F_DT]   == dt_ref
+        @test st.fh[S.F_DISP] == 4 * disp
+        @test st.fh[S.F_DX]   == 4 * disp
+        @test st.ih[S.I_PHASE] == S.PHASE_DT_READY
+        @test st.ih[S.I_STOP]  == S.STOP_REBUILD          # 4 * disp >= h
+        # nothing runs while stopped
+        launch_commit!(st)
+        readback!(st)
+        @test st.ih[S.I_ITER] == 0 && st.fh[S.F_TIME] == 0
+        # after the rebuild the stored dt is kept and the step commits
+        S.resume_after_rebuild!(st)
+        launch_finish!(st, red, kern, consts)
+        launch_commit!(st)
+        readback!(st)
+        @test st.fh[S.F_DX] == 0
+        @test st.fh[S.F_DT] == dt_ref
+        @test st.fh[S.F_TIME] == dt_ref
+        @test st.ih[S.I_ITER] == 1
+        @test st.ih[S.I_PHASE] == S.PHASE_NEED_DT
+        @test st.ih[S.I_STOP]  == S.STOP_NONE
+        # a second step accumulates the displacement bound
+        copyto!(red.partial, fill(SVector{3, T}(0.1, 2.0, 1e-4), red.nblocks))
+        launch_finish!(st, red, kern, consts)
+        launch_commit!(st)
+        readback!(st)
+        @test st.fh[S.F_DX] == 4e-4
+        @test st.fh[S.F_DT] == consts.CFL * min(2.0, h / (consts.c₀ + 0.1))
+        @test st.fh[S.F_TIME] == dt_ref + st.fh[S.F_DT]
+        @test st.ih[S.I_ITER] == 2
+        # output time reached: stop before computing anything
+        S.set_output_time!(st, 0.0)
+        launch_finish!(st, red, kern, consts)
+        launch_commit!(st)
+        readback!(st)
+        @test st.ih[S.I_STOP] == S.STOP_OUTPUT
+        @test st.ih[S.I_ITER] == 2
+        @test st.ih[S.I_PHASE] == S.PHASE_NEED_DT
+
+        # batch size: estimate until rebuild / output, at most kmax, at least 1
+        bs = SPHExampleGPU.SPHCellList.batch_size
+        st.fh[S.F_DX] = 0.0; st.fh[S.F_DISP] = h / 10; st.fh[S.F_DT] = 1e-3; st.fh[S.F_TIME] = 0.0
+        @test bs(st, h, 1.0, 32) == 11          # 10 steps until Δx reaches h, plus one
+        @test bs(st, h, 0.0035, 32) == 4        # 3.5 steps until the output, plus one
+        @test bs(st, h, 1.0, 4) == 4
+        @test bs(st, h, 1.0, 1) == 1
+        st.fh[S.F_DX] = h
+        @test bs(st, h, 1.0, 32) == 1           # rebuild already due
+        st.fh[S.F_DX] = 0.0; st.fh[S.F_DISP] = 0.0; st.fh[S.F_DT] = 0.0
+        @test bs(st, h, 1.0, 32) == 32          # no information: fill the batch
+
+        # a stopped state gates the particle kernels
+        n = 2_048
+        V = SVector{2, T}
+        rnd() = V(randn(T), randn(T))
+        P = [rnd() for _ in 1:n]
+        dP = CuArray(P); dV = CuArray([rnd() for _ in 1:n]); dA = CuArray([rnd() for _ in 1:n])
+        dρ = CuArray(1000 .+ rand(T, n)); dPr = CUDA.zeros(T, n); ddρ = CuArray(randn(T, n))
+        dρn = CuArray(1000 .+ rand(T, n)); dPn = CuArray(P); dVn = CuArray([rnd() for _ in 1:n])
+        dty = CuArray(fill(Fluid, n)); dC = CuArray([rnd() for _ in 1:n]); dr = CuArray(rand(T, n))
+        red2 = ReductionWorkspace{SVector{3, T}}(n)
+        launch_final_step!(dP, dV, dA, dρ, dPr, ddρ, dρn, dPn, dVn, dty, dC, dr, st, kern, consts, red2, Val(false))
+        @test Array(dP) == P
+        S.set_output_time!(st, 1.0)
+        launch_final_step!(dP, dV, dA, dρ, dPr, ddρ, dρn, dPn, dVn, dty, dC, dr, st, kern, consts, red2, Val(false))
+        @test Array(dP) != P
+    end
+
+    @testset "graph replay and batching reproduce direct launches" begin
+        # The same steps, once as replayed CUDA graphs in batches and once
+        # launched directly with a read back after every step, must give the
+        # same bits (deterministic sort keeps the particle order identical).
+        case = BENCH_CASES[findfirst(c -> c.name == "StillWedge2D_MDBC_dp0.02", BENCH_CASES)]
+        p1, m1 = run_gpu(case, Float64, 0.004)
+        p2, m2 = run_gpu(case, Float64, 0.004; GPUUseGraph = false, GPUMaxStepsPerSync = 1)
+        @test m1.Iteration == m2.Iteration > 1
+        @test m1.TotalTime == m2.TotalTime
+        @test p1.ID == p2.ID
+        @test p1.Position == p2.Position
+        @test p1.Velocity == p2.Velocity
+        @test p1.Density  == p2.Density
+    end
+
     @testset "models use the densities passed by the kernel" begin
         # The kernel hands the models ρᵢ, ρⱼ and their reciprocals of the state
         # being evaluated. The built in models must not reach back into a
@@ -244,6 +425,19 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
             Dᵢ, Dⱼ = compute_density_diffusion(model, kern, consts, nothing, xᵢⱼ, ∇W, d²,
                                                ρᵢ, ρⱼ, inv(ρᵢ), inv(ρⱼ), 1, 2, types)
             @test isfinite(Dᵢ) && Dⱼ == -Dᵢ
+        end
+        # The gated models are exactly zero unless both particles are fluid and
+        # non zero (the gate is a select of the full term) when both are.
+        for model in (LinearDensityDiffusion(), ComplexDensityDiffusion())
+            Dᵢ, Dⱼ = compute_density_diffusion(model, kern, consts, nothing, xᵢⱼ, ∇W, d²,
+                                               ρᵢ, ρⱼ, inv(ρᵢ), inv(ρⱼ), 1, 2, [Fluid, Fixed])
+            @test Dᵢ == 0 && Dⱼ == 0
+            Dᵢ, Dⱼ = compute_density_diffusion(model, kern, consts, nothing, xᵢⱼ, ∇W, d²,
+                                               ρᵢ, ρⱼ, inv(ρᵢ), inv(ρⱼ), 1, 2, [Fixed, Fluid])
+            @test Dᵢ == 0 && Dⱼ == 0
+            Dᵢ, _ = compute_density_diffusion(model, kern, consts, nothing, xᵢⱼ, ∇W, d²,
+                                              ρᵢ, ρⱼ, inv(ρᵢ), inv(ρⱼ), 1, 2, [Fluid, Fluid])
+            @test Dᵢ != 0
         end
         # Laminar viscosity is antisymmetric in the density arguments and
         # depends on them, so passing different densities must change it.

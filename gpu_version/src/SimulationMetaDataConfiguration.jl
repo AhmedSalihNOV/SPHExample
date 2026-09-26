@@ -93,6 +93,7 @@ mutable struct SimulationMetaData{Dimensions,
     GPUMaxStepsPerSync::Int      # upper bound on the time steps enqueued between two host read backs
     GPUUseGraph::Bool            # replay the launch sequence of a step as a CUDA graph
     GPUCellSubdivision::Int      # cells per support radius H per axis (1: edge H, 3^D stencil; 2: edge H/2, 5^D stencil)
+    GPUPackedLayout::Bool        # pair kernel reads position+pressure and velocity+density as 16 byte aligned vectors
 end
 
 # Particle fields that can be written to the output files. `Position` is always
@@ -190,6 +191,7 @@ function SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode}(;
         GPUMaxStepsPerSync::Int                 = 32,
         GPUUseGraph::Bool                       = true,
         GPUCellSubdivision::Int                 = 1,
+        GPUPackedLayout::Bool                   = true,
     ) where {Dimensions, FloatType <: AbstractFloat, SMode <: ShiftingMode, KMode <: KernelOutputMode,
              BMode <: MDBCMode, LMode <: LogMode}
     GPUCellSubdivision >= 1 || throw(ArgumentError("GPUCellSubdivision must be at least 1, got $GPUCellSubdivision"))
@@ -201,7 +203,7 @@ function SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode}(;
         IndexCounter, ProgressSpecification, VisualizeInParaview, ExportSingleVTKHDF, ExportGridCells,
         OutputVariables, OpenLogFile, TimeSteppingMode,
         GPUSyncTimers, GPUDeterministicSort, GPUMaxCells, GPUInteractionThreads, GPULanesPerParticle,
-        GPUBoundaryForces, GPUAsyncOutput, GPUMaxStepsPerSync, GPUUseGraph, GPUCellSubdivision,
+        GPUBoundaryForces, GPUAsyncOutput, GPUMaxStepsPerSync, GPUUseGraph, GPUCellSubdivision, GPUPackedLayout,
     )
 end
 

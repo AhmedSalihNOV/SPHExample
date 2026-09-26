@@ -200,7 +200,7 @@ definitions in `benchmark/cases.jl` construct against either package.
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `GPUSyncTimers` | `false` | Synchronize after every phase so the `TimerOutputs` table shows real per kernel times (costs a few percent). |
+| `GPUSyncTimers` | `false` | Synchronize after every kernel phase so the timer table lists the kernels of a step separately under "Time steps" (one step per batch, no graphs; costs a few percent). |
 | `GPUDeterministicSort` | `true` | Sort particles inside each cell after the counting sort; results become bitwise reproducible between runs. |
 | `GPUMaxCells` | `50_000_000` | Abort with a clear message if the neighbour grid would need more cells (a particle escaped). |
 | `GPUInteractionThreads` | `128` | Threads per block of the interaction and mDBC kernels. |
@@ -210,8 +210,35 @@ definitions in `benchmark/cases.jl` construct against either package.
 | `GPUMaxStepsPerSync` | `32` | Upper bound on the steps enqueued between two host read backs of the device resident step state. The actual batch is the estimated number of steps until the next cell list rebuild or output. `1` reproduces a synchronization per step. |
 | `GPUUseGraph` | `true` | Capture the launch sequence of a step as a CUDA graph and replay it. Disabled automatically with `GPUSyncTimers`. |
 | `GPUCellSubdivision` | `1` | Cells per support radius `H` along each axis: `1` bins at `H` with a 3^D stencil (the CPU's cells), `2` at `H/2` with a 5^D stencil. Same neighbour pairs, fewer distance checks, more cell ranges per particle. Only `1` reproduces the CPU's orientation of the asymmetric density diffusion term (the results of the two grids differ by that term only). `2` pays off with one lane per particle (large cases); with many lanes it is slower. |
+| `GPUPackedLayout` | `true` | The pair kernel reads each candidate's position with its pressure and its velocity with its density from two 16 byte aligned `SVector{4}` buffers (the DualSPHysics layout) instead of from the separate arrays; see "Packed particle state" above. The buffers are filled by the state preparation and half step kernels, so the separate arrays stay the source of truth and custom models still receive them. Same results up to FMA contraction noise. |
 
 `OutputTimes` also accepts `Float64` values or vectors when `FloatType = Float32`.
+
+### Timing and run statistics
+
+`SimMetaData.HourGlass` (a `TimerOutput`) is printed at the end of a run and
+written to the log. Its sections follow what the host actually waits for:
+
+| Section | Contains |
+|---------|----------|
+| `Upload to GPU` | Allocation of the device arrays and the copy of the initial state. |
+| `Simulation` | One call per output interval: the whole time stepping loop. |
+| `Simulation / Time steps` | A batch of steps: the launches and the read back that waits for them, so this is the GPU time of the steps (one call per host read back). With `GPUSyncTimers` the kernels of a step appear as numbered children. |
+| `Simulation / Cell list rebuild` | Counting sort and reordering of the particle arrays, plus the re-evaluation of the carried derivative with `SingleNeighborTimeStepping`, synchronized so the number is real. |
+| `Output` | One call per output: waiting for the previous asynchronous file write, the download of the output fields, the optional cell grid export and (without `GPUAsyncOutput`) the file writes. |
+| `Finalize` | Closing the files and the final download of the complete state. |
+
+Below the table a short run summary reports the time per step, the particle
+steps per second, how often the cell list was rebuilt and the host read the
+step state back, and how much of the wall time went into output (the
+asynchronous file writes overlap with the GPU and are listed separately from
+the time the host had to wait for them).
+
+The time step history is written to `<SaveLocation>/<SimulationName>_TimeSteps.csv`
+with the columns `Iteration, TotalTime, TimeStep, WallTime` (seconds since the
+start of the run), one line per host read back (every batch of at most
+`GPUMaxStepsPerSync` steps). Plot it with any tool; the file is flushed after
+every line, so an aborted run keeps its history.
 
 ## Layout
 

@@ -27,10 +27,10 @@ const BENCH_TIME_STEPPING = SymplecticTimeStepping()
 
 Seconds spent in the time stepping loop. The CPU package times every step
 under "00 Simulation Step", the GPU package every output interval under
-"00 SimulationLoop".
+"Simulation" ("00 SimulationLoop" before SPHExampleGPU 0.8).
 """
 function loop_time(hg::TimerOutput)
-    for key in ("00 SimulationLoop", "00 Simulation Step")
+    for key in ("Simulation", "00 SimulationLoop", "00 Simulation Step")
         haskey(hg.inner_timers, key) && return TimerOutputs.time(hg[key]) / 1e9
     end
     error("no time stepping loop timer found; top level timers: $(collect(keys(hg.inner_timers)))")

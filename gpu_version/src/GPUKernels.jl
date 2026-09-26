@@ -28,10 +28,21 @@ Every kernel of a time step takes the device resident step state (`step`, see
 first thing each kernel does is to return when the stop flag is set. The grid
 description is read from a one element device vector (`load_grid`), so none
 of the launch arguments of a step change between steps.
+
+The pair kernel can read the evaluated state from two packed 16 byte aligned
+buffers instead of the separate arrays (`PackedState`, `GPUPackedLayout`):
+position with pressure and velocity with density, each an `SVector{4, T}`
+(the fourth slot of a 2D case is padding). A 3D `Float32` position is 12
+bytes and not 16 byte aligned, so the separate layout needs three scalar
+loads for it and six loads per candidate in total; the packed layout loads a
+candidate with two vector loads (`load_aligned`) plus the reciprocal density.
+The buffers are filled by the kernels that produce the state
+(`launch_prepare_state!`, `launch_half_step!`).
 """
 module GPUKernels
 
 using CUDA
+using Adapt
 using StaticArrays
 using LinearAlgebra
 
@@ -45,11 +56,78 @@ using ..GPUReductions
 using ..GPUStepState
 
 export launch_interactions!, launch_mdbc!, launch_motion!, launch_half_step!, launch_final_step!,
-       launch_inv_density!, launch_finish!, launch_commit!, launch_step_reduction!,
-       step_map, step_reduce, choose_lanes, ELEMENTWISE_THREADS
+       launch_inv_density!, launch_prepare_state!, launch_finish!, launch_commit!, launch_step_reduction!,
+       step_map, step_reduce, choose_lanes, ELEMENTWISE_THREADS,
+       PackedState, pack4, PACKED_ALIGN
 
 const ELEMENTWISE_THREADS = REDUCE_THREADS
 const FULL_MASK = 0xffffffff
+
+#---------------------------------------------------------------
+# Packed particle state (position + pressure, velocity + density)
+#---------------------------------------------------------------
+
+"""
+    PackedState(PosP, VelRho)
+
+The evaluated particle state in two `SVector{4, T}` buffers: `PosP[j]` holds
+the position in the first `D` slots and the pressure in slot `D + 1`,
+`VelRho[j]` the velocity and the density in the same slots (slot 4 of a 2D
+case is zero padding). A `Float32` element is 16 bytes, a `Float64` element
+32, both multiples of the 16 byte load width of the GPU, so one candidate is
+read with two (`Float32`) or four (`Float64`) vector loads instead of six to
+nine scalar loads. Constructed by the host with `CuVector`s and passed to the
+kernels, where `Adapt` converts the fields to device arrays.
+"""
+struct PackedState{A, B}
+    PosP::A
+    VelRho::B
+end
+
+Adapt.adapt_structure(to, p::PackedState) = PackedState(Adapt.adapt(to, p.PosP), Adapt.adapt(to, p.VelRho))
+
+"""
+    PackedState{T}(n) -> PackedState of two zeroed `CuVector{SVector{4, T}}` of length `n`
+"""
+PackedState{T}(n::Integer) where {T} = PackedState(CUDA.zeros(SVector{4, T}, n), CUDA.zeros(SVector{4, T}, n))
+
+Base.length(p::PackedState) = length(p.PosP)
+
+# Alignment (bytes) of the packed loads and stores: the width of the widest
+# vector memory instruction. Device allocations are 256 byte aligned and the
+# elements are 16 or 32 bytes, so every element satisfies it.
+const PACKED_ALIGN = 16
+
+"""
+    pack4(x::SVector{D, T}, s::T) -> SVector{4, T}
+
+`x` in the first `D` slots, `s` in slot `D + 1`, zeros after (`D <= 3`).
+"""
+@inline function pack4(x::SVector{D, T}, s::T) where {D, T}
+    return SVector{4, T}(ntuple(k -> k <= D ? x[k] : (k == D + 1 ? s : zero(T)), Val(4)))
+end
+
+@inline unpack_vec(a::SVector{4, T}, ::Val{D}) where {T, D} = SVector{D, T}(ntuple(k -> a[k], Val(D)))
+
+# `A[j]` and `A[j] = x` with the alignment `PACKED_ALIGN` instead of the
+# alignment of the element type (4 or 8 bytes), which is what `CuDeviceArray`
+# indexing tells LLVM and which prevents the `ld.global.v4` instruction.
+@inline function load_aligned(A::CuDeviceArray{SVector{4, T}}, j::Integer) where {T}
+    return unsafe_load(pointer(A), j, Val(PACKED_ALIGN))
+end
+
+@inline function store_aligned!(A::CuDeviceArray{SVector{4, T}}, x::SVector{4, T}, j::Integer) where {T}
+    unsafe_store!(pointer(A), x, j, Val(PACKED_ALIGN))
+    return nothing
+end
+
+# Store the packed slots of particle `i`; no-op without a packed state.
+@inline store_packed!(::Nothing, i, x, P, v, ρ) = nothing
+@inline function store_packed!(packed::PackedState, i, x::SVector{D, T}, P::T, v::SVector{D, T}, ρ::T) where {D, T}
+    store_aligned!(packed.PosP, pack4(x, P), i)
+    store_aligned!(packed.VelRho, pack4(v, ρ), i)
+    return nothing
+end
 
 #---------------------------------------------------------------
 # Helpers shared by the kernels
@@ -136,33 +214,82 @@ function launch_motion!(Position, Velocity, ParticleType, GroupMarker, motion, s
 end
 
 #---------------------------------------------------------------
-# Reciprocal of the start-of-step density (after the mDBC correction and any
-# reordering by a cell list rebuild)
+# Preparation of the start-of-step state for the neighbour loop: the
+# reciprocal density (after the mDBC correction and any reordering by a cell
+# list rebuild) and, with a packed layout, the packed copies of the state.
 #---------------------------------------------------------------
 
-function inv_density_kernel!(InvDensity, Density, step, n::Int32)
+function prepare_state_kernel!(InvDensity, Density, packed, Position, Velocity, Pressure, step, n::Int32)
     step_active(step) || return nothing
     i = thread_index()
     i > n && return nothing
-    @inbounds InvDensity[i] = inv(Density[i])
+    @inbounds begin
+        ρ = Density[i]
+        InvDensity[i] = inv(ρ)
+        if packed !== nothing
+            store_packed!(packed, i, Position[i], Pressure[i], Velocity[i], ρ)
+        end
+    end
     return nothing
 end
 
-function launch_inv_density!(InvDensity, Density, step)
+"""
+    launch_prepare_state!(InvDensity, Density, packed, Position, Velocity, Pressure, step)
+
+`InvDensity = 1 ./ Density` and, when `packed` is a `PackedState` rather
+than `nothing`, its packed copies of `Position`, `Pressure`, `Velocity` and
+`Density` (see `PackedState`). Must run after the mDBC correction so that the
+packed pressure matches the corrected density.
+"""
+function launch_prepare_state!(InvDensity, Density, packed, Position, Velocity, Pressure, step)
     n = length(Density)
     n == 0 && return nothing
-    @cuda threads=ELEMENTWISE_THREADS blocks=cld(n, ELEMENTWISE_THREADS) inv_density_kernel!(
-        InvDensity, Density, step, Int32(n))
+    @cuda threads=ELEMENTWISE_THREADS blocks=cld(n, ELEMENTWISE_THREADS) prepare_state_kernel!(
+        InvDensity, Density, packed, Position, Velocity, Pressure, step, Int32(n))
     return nothing
 end
+
+"""
+    launch_inv_density!(InvDensity, Density, step)
+
+`InvDensity = 1 ./ Density` alone (the separate array layout).
+"""
+launch_inv_density!(InvDensity, Density, step) =
+    launch_prepare_state!(InvDensity, Density, nothing, nothing, nothing, nothing, step)
 
 #---------------------------------------------------------------
 # Particle interactions (gather)
 #---------------------------------------------------------------
 
+# Loads of the evaluated state of one particle. With the separate layout the
+# position is loaded first and the rest only for candidates inside the
+# support; with the packed layout the pressure arrives with the position and
+# the density with the velocity, so the split is position + pressure first
+# and velocity + density + reciprocal density second.
+@inline function load_position(::Nothing, Position, Pressure, j, ::Val{D}) where {D}
+    @inbounds return Position[j], zero(eltype(Pressure))
+end
+@inline function load_position(packed::PackedState, Position, Pressure, j, ::Val{D}) where {D}
+    a = load_aligned(packed.PosP, j)
+    return unpack_vec(a, Val(D)), a[D + 1]
+end
+
+@inline function load_pressure(::Nothing, Pressure, j, P)
+    @inbounds return Pressure[j]
+end
+@inline load_pressure(::PackedState, Pressure, j, P) = P
+
+@inline function load_motion(::Nothing, Velocity, Density, j, ::Val{D}) where {D}
+    @inbounds return Velocity[j], Density[j]
+end
+@inline function load_motion(packed::PackedState, Velocity, Density, j, ::Val{D}) where {D}
+    b = load_aligned(packed.VelRho, j)
+    return unpack_vec(b, Val(D)), b[D + 1]
+end
+
 function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ,
                              Position::AbstractVector{SVector{D, T}}, Density, InvDensity, Pressure,
-                             Velocity, ParticleType, SimParticles,
+                             Velocity, ParticleType, SimParticles, packed,
                              CellStart, CellID, gridarg, step,
                              SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                              ::Val{FlagKernel}, ::Val{FlagShift}, ::Val{BoundaryForces}, ::Val{K},
@@ -185,11 +312,10 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
     ∇r    = zero(T)
 
     @inbounds if valid
-        xᵢ  = Position[i]
-        vᵢ  = Velocity[i]
-        ρᵢ  = Density[i]
+        xᵢ, Pᵢ = load_position(packed, Position, Pressure, i, Val(D))
+        vᵢ, ρᵢ = load_motion(packed, Velocity, Density, i, Val(D))
+        Pᵢ  = load_pressure(packed, Pressure, i, Pᵢ)
         ρᵢ⁻¹ = InvDensity[i]
-        Pᵢ  = Pressure[i]
         MLᵢ = MotionLimiterValue(T, ParticleType[i])
 
         # Boundary particles only need the density rate; their acceleration is
@@ -207,16 +333,16 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
             j = jlo + lane
             while j <= jhi
                 if j != i
-                    xᵢⱼ  = xᵢ - Position[j]
+                    xⱼ, Pⱼ = load_position(packed, Position, Pressure, j, Val(D))
+                    xᵢⱼ  = xᵢ - xⱼ
                     xᵢⱼ² = dot(xᵢⱼ, xᵢⱼ)
                     if xᵢⱼ² <= H²
                         dᵢⱼ   = sqrt(xᵢⱼ²)
                         q     = dᵢⱼ * h⁻¹ # in [0, 2]: the guard above enforces xᵢⱼ² <= H² = (2h)²
                         ∇ᵢWᵢⱼ = ∇Wᵢⱼ(SimKernel, q, xᵢⱼ)
 
-                        ρⱼ   = Density[j]
+                        vⱼ, ρⱼ = load_motion(packed, Velocity, Density, j, Val(D))
                         ρⱼ⁻¹ = InvDensity[j]
-                        vⱼ   = Velocity[j]
                         vᵢⱼ  = vᵢ - vⱼ
                         density_symmetric_term = dot(-vᵢⱼ, ∇ᵢWᵢⱼ)
                         dρdt += -ρᵢ * (m₀ * ρⱼ⁻¹) * density_symmetric_term
@@ -246,7 +372,7 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
                                                       ρa, ρb, ρa⁻¹, ρb⁻¹, ia, ja)
                             visc  = sgn * v1
 
-                            Pⱼ   = Pressure[j]
+                            Pⱼ   = load_pressure(packed, Pressure, j, Pⱼ)
                             Pfac = (Pᵢ + Pⱼ) * (ρᵢ⁻¹ * ρⱼ⁻¹)
                             f_ab = tensile_correction(SimKernel, Pᵢ, ρᵢ, Pⱼ, ρⱼ, q, dx)
                             dvdt = -m₀ * (Pfac + f_ab) * ∇ᵢWᵢⱼ
@@ -301,7 +427,7 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
 end
 
 """
-    launch_interactions!(...; threads, lanes)
+    launch_interactions!(...; threads, lanes, boundary_forces, packed)
 
 Launch the gather interaction kernel. `Position`, `Density`, `InvDensity`,
 `Pressure` and `Velocity` are the arrays of the state being evaluated (the
@@ -313,14 +439,17 @@ CPU code. Custom models additionally get the same arrays as the NamedTuple
 `CellGrid` or the device vector holding it, `step` the step state (see
 `GPUStepState`). `lanes` is the number of warp lanes per particle (`Val`).
 With `boundary_forces = Val(false)` the momentum terms are skipped for
-particles with `MotionLimiter == 0`.
+particles with `MotionLimiter == 0`. With `packed` a `PackedState` holding
+the packed copies of the same state (see `PackedState`) the kernel reads the
+position, pressure, velocity and density of the candidates from it instead
+of the separate arrays; the models still receive the separate arrays.
 """
 function launch_interactions!(dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ,
                               Position, Density, InvDensity, Pressure, Velocity, ParticleType,
                               CellStart, CellID, grid, step,
                               SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                               FlagKernel::Val, FlagShift::Val; threads::Integer = 128, lanes::Val = Val(1),
-                              boundary_forces::Val = Val(true))
+                              boundary_forces::Val = Val(true), packed::Union{Nothing, PackedState} = nothing)
     n = length(Position)
     n == 0 && return nothing
     K = typeof(lanes).parameters[1]
@@ -328,7 +457,7 @@ function launch_interactions!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C
                     Type = ParticleType)
     @cuda threads=threads blocks=cld(n * K, threads) interaction_kernel!(
         dρdtI, Acceleration, Kernel, KernelGradient, ∇Cᵢ, ∇◌rᵢ,
-        Position, Density, InvDensity, Pressure, Velocity, ParticleType, SimParticles,
+        Position, Density, InvDensity, Pressure, Velocity, ParticleType, SimParticles, packed,
         CellStart, CellID, grid, step,
         SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
         FlagKernel, FlagShift, boundary_forces, lanes, Int32(n))
@@ -504,7 +633,7 @@ end
 
 function half_step_kernel!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, InvDensityₙ⁺, Pressure,
                            Position, Velocity, Acceleration, Density, dρdtI,
-                           ParticleType, GroupMarker, motion, step, SimConstants, n::Int32)
+                           ParticleType, GroupMarker, motion, packed, step, SimConstants, n::Int32)
     step_active(step) || return nothing
     i = thread_index()
     i > n && return nothing
@@ -518,8 +647,10 @@ function half_step_kernel!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, InvDensity�
         acc = Acceleration[i]
         acc += ConstructGravitySVector(acc, g * GravityFactorValue(T, type))
         Acceleration[i] = acc
-        Positionₙ⁺[i]   = Position[i] + Velocity[i] * dt₂ * ML
-        Velocityₙ⁺[i]   = Velocity[i] + acc * dt₂ * ML
+        xₙ⁺ = Position[i] + Velocity[i] * dt₂ * ML
+        vₙ⁺ = Velocity[i] + acc * dt₂ * ML
+        Positionₙ⁺[i]   = xₙ⁺
+        Velocityₙ⁺[i]   = vₙ⁺
         ρ = Density[i] + dρdtI[i] * dt₂
         ρ = limit_density(ρ, ρ₀, ML)
         ρₙ⁺[i] = ρ
@@ -527,20 +658,30 @@ function half_step_kernel!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, InvDensity�
 
         apply_motion!(i, Position, Velocity, ParticleType, GroupMarker, motion, dt₂, TotalTime)
 
-        Pressure[i] = EquationOfStateGamma7(ρ, c₀, ρ₀)
+        P = EquationOfStateGamma7(ρ, c₀, ρ₀)
+        Pressure[i] = P
+        store_packed!(packed, i, xₙ⁺, P, vₙ⁺, ρ)
     end
     return nothing
 end
 
+"""
+    launch_half_step!(...; packed = nothing)
+
+Predictor half step. With `packed` a `PackedState` the packed copies of the
+half step position, pressure, velocity and density are written as well, for
+the second neighbour loop.
+"""
 function launch_half_step!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, InvDensityₙ⁺, Pressure,
                            Position, Velocity, Acceleration, Density, dρdtI,
-                           ParticleType, GroupMarker, motion, step, SimConstants)
+                           ParticleType, GroupMarker, motion, step, SimConstants;
+                           packed::Union{Nothing, PackedState} = nothing)
     n = length(Position)
     n == 0 && return nothing
     @cuda threads=ELEMENTWISE_THREADS blocks=cld(n, ELEMENTWISE_THREADS) half_step_kernel!(
         Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, InvDensityₙ⁺, Pressure,
         Position, Velocity, Acceleration, Density, dρdtI,
-        ParticleType, GroupMarker, motion, step, SimConstants, Int32(n))
+        ParticleType, GroupMarker, motion, packed, step, SimConstants, Int32(n))
     return nothing
 end
 

@@ -243,6 +243,35 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
         end
     end
 
+    @testset "packed layout reproduces the separate arrays" begin
+        # `GPUPackedLayout` only changes how the pair kernel loads the same
+        # values (two 16 byte vectors instead of six scalars), so both layouts
+        # must agree to the FMA contraction noise of a recompiled kernel.
+        K = SPHExampleGPU.GPUKernels
+        x = SVector(1.0f0, 2.0f0, 3.0f0)
+        @test pack4(x, 4.0f0) === SVector(1.0f0, 2.0f0, 3.0f0, 4.0f0)
+        @test pack4(SVector(1.0, 2.0), 3.0) === SVector(1.0, 2.0, 3.0, 0.0)
+        @test K.unpack_vec(pack4(x, 4.0f0), Val(3)) === x
+        @test PACKED_ALIGN == 16
+        @test sizeof(SVector{4, Float32}) == 16 && sizeof(SVector{4, Float64}) == 2 * 16
+        p = PackedState{Float32}(10)
+        @test length(p) == 10 && eltype(p.PosP) === SVector{4, Float32}
+        for (name, T, simtime, tol) in (("StillWedge2D_MDBC_dp0.02", Float32, 0.004, 1e-4),
+                                        ("MovingSquare2D_dp0.04", Float32, 0.004, 1e-4),
+                                        ("DamBreak3D_dp0.02", Float32, 0.002, 1e-4),
+                                        ("DamBreak3D_dp0.02", Float64, 0.002, 1e-10))
+            case = BENCH_CASES[findfirst(c -> c.name == name, BENCH_CASES)]
+            p1, m1 = run_gpu(case, T, simtime; GPUPackedLayout = false)
+            p2, m2 = run_gpu(case, T, simtime; GPUPackedLayout = true)
+            @test m1.Iteration == m2.Iteration > 1
+            @test p1.ID == p2.ID
+            @test relerr(p2.Density, p1.Density) < tol
+            @test relerr(p2.Pressure, p1.Pressure) < 10 * tol
+            @test maximum(norm.(p2.Position .- p1.Position)) < tol
+            @test maximum(norm.(p2.Velocity .- p1.Velocity)) < 10 * tol
+        end
+    end
+
     @testset "fused reduction" begin
         n = 100_003
         x = CuArray(rand(Float64, n))

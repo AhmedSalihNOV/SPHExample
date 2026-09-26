@@ -17,7 +17,6 @@ using LinearAlgebra
 using Printf
 using TimerOutputs
 using Logging, LoggingExtras
-using UnicodePlots
 
 using ..SimulationEquations
 using ..SimulationGeometry
@@ -152,9 +151,13 @@ densities and shifting terms). They are never reordered because they are
 overwritten after every cell list update. `InvDensity` holds `1 / Density`
 of the start-of-step state and `InvDensityₙ⁺` that of the predictor state;
 the interaction kernel multiplies by them instead of dividing per pair
-(same as `FillInverseDensity!` of the CPU code).
+(same as `FillInverseDensity!` of the CPU code). `packed` holds the packed
+copies (position with pressure, velocity with density) of the state the
+neighbour loop evaluates (`PackedState`); it is only written and read with
+`GPUPackedLayout`, and one set suffices because the first neighbour loop of
+a step completes before the half step kernel repacks the predictor state.
 """
-struct GPUSupportArrays{D, T}
+struct GPUSupportArrays{D, T, P <: PackedState}
     dρdtI::CuVector{T}
     Velocityₙ⁺::CuVector{SVector{D, T}}
     Positionₙ⁺::CuVector{SVector{D, T}}
@@ -163,10 +166,12 @@ struct GPUSupportArrays{D, T}
     InvDensityₙ⁺::CuVector{T}
     ∇Cᵢ::CuVector{SVector{D, T}}
     ∇◌rᵢ::CuVector{T}
+    packed::P
 end
 
 function GPUSupportArrays{D, T}(n::Integer) where {D, T}
-    return GPUSupportArrays{D, T}(
+    packed = PackedState{T}(n)
+    return GPUSupportArrays{D, T, typeof(packed)}(
         CUDA.zeros(T, n),
         CUDA.zeros(SVector{D, T}, n),
         CUDA.zeros(SVector{D, T}, n),
@@ -175,6 +180,7 @@ function GPUSupportArrays{D, T}(n::Integer) where {D, T}
         CUDA.zeros(T, n),
         CUDA.zeros(SVector{D, T}, n),
         CUDA.zeros(T, n),
+        packed,
     )
 end
 
@@ -297,8 +303,9 @@ end
 
 Enqueue the evaluation of the start-of-step state: the mDBC correction of
 the boundary densities together with the pressure of the corrected density
-(`launch_mdbc!`, with `SimpleMDBC`), the reciprocal densities and the
-neighbour loop that produces `dρdtI` and the acceleration. The symplectic
+(`launch_mdbc!`, with `SimpleMDBC`), the reciprocal densities (and, with
+`GPUPackedLayout`, the packed copies of the state; `launch_prepare_state!`)
+and the neighbour loop that produces `dρdtI` and the acceleration. The symplectic
 scheme runs this at every step as its first neighbour loop. The single
 neighbour scheme carries the corrector derivative of the previous step into
 the predictor instead and only runs this to start that derivative: before
@@ -307,7 +314,7 @@ gates every kernel; `mdbc_name` and `loop_name` are the timer labels.
 """
 function enqueue_state_derivative!(ctx, step, timed::Bool, mdbc_name::AbstractString, loop_name::AbstractString)
     (; gpu, cl, sup, SimKernel, SimConstants, SimDensityDiffusion, SimViscosity,
-       FlagKernel, FlagShift, UseMDBC, threads, lanes, bforces, HourGlass) = ctx
+       FlagKernel, FlagShift, UseMDBC, threads, lanes, bforces, packed, HourGlass) = ctx
     grid      = cl.grid_dev
     CellStart = cl.CellStart
 
@@ -318,13 +325,13 @@ function enqueue_state_derivative!(ctx, step, timed::Bool, mdbc_name::AbstractSt
     end
 
     @phase HourGlass loop_name timed begin
-        launch_inv_density!(sup.InvDensity, gpu.Density, step)
+        launch_prepare_state!(sup.InvDensity, gpu.Density, packed, gpu.Position, gpu.Velocity, gpu.Pressure, step)
         launch_interactions!(sup.dρdtI, gpu.Acceleration, gpu.Kernel, gpu.KernelGradient, sup.∇Cᵢ, sup.∇◌rᵢ,
                              gpu.Position, gpu.Density, sup.InvDensity, gpu.Pressure,
                              gpu.Velocity, gpu.Type, CellStart, gpu.CellID, grid, step,
                              SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
                              FlagKernel, FlagShift; threads = threads, lanes = lanes,
-                             boundary_forces = bforces)
+                             boundary_forces = bforces, packed = packed)
     end
     return nothing
 end
@@ -349,19 +356,19 @@ rebuild, see `SimulationLoop`.)
 """
 function enqueue_step!(ctx, timed::Bool)
     (; gpu, cl, sup, red, motion, state, SimKernel, SimConstants, SimDensityDiffusion, SimViscosity,
-       FlagKernel, FlagShift, UseMDBC, SingleNeighbor, threads, lanes, bforces, HourGlass) = ctx
+       FlagKernel, FlagShift, UseMDBC, SingleNeighbor, threads, lanes, bforces, packed, HourGlass) = ctx
     grid      = cl.grid_dev
     CellStart = cl.CellStart
 
     # dt of this step from the reduction of the previous one; also decides
     # whether the step may run at all (cell list rebuild, output time).
-    @phase HourGlass "01 Update TimeStep" timed launch_finish!(state, red, SimKernel, SimConstants)
+    @phase HourGlass "01 Time step size" timed launch_finish!(state, red, SimKernel, SimConstants)
 
     # The pressure of the start-of-step density was already computed by the
     # final kernel of the previous step (and on the host before the first).
     if motion.active
-        @phase HourGlass "Motion" timed launch_motion!(gpu.Position, gpu.Velocity, gpu.Type, gpu.GroupMarker,
-                                                       motion, state)
+        @phase HourGlass "02 Boundary motion" timed launch_motion!(gpu.Position, gpu.Velocity, gpu.Type, gpu.GroupMarker,
+                                                                   motion, state)
     end
 
     if SingleNeighbor
@@ -369,35 +376,35 @@ function enqueue_step!(ctx, timed::Bool)
         # predictor and the final density update start from are corrected
         # every step, the carried derivative is kept.
         if UseMDBC
-            @phase HourGlass "04a NeighborLoopMDBC before Half TimeStep" timed launch_mdbc!(
+            @phase HourGlass "03 mDBC" timed launch_mdbc!(
                 gpu.Density, gpu.Pressure, gpu.Position, gpu.GhostPoints, gpu.Type, CellStart, grid, state,
                 SimKernel, SimConstants; threads = threads, lanes = lanes)
         end
     else
-        enqueue_state_derivative!(ctx, state, timed, "04a First NeighborLoopMDBC", "04 First NeighborLoop")
+        enqueue_state_derivative!(ctx, state, timed, "03 mDBC", "04 Neighbour loop (predictor)")
     end
 
-    @phase HourGlass "05b Update To Half TimeStep" timed launch_half_step!(
+    @phase HourGlass "05 Half step" timed launch_half_step!(
         sup.Positionₙ⁺, sup.Velocityₙ⁺, sup.ρₙ⁺, sup.InvDensityₙ⁺, gpu.Pressure,
         gpu.Position, gpu.Velocity, gpu.Acceleration, gpu.Density, sup.dρdtI,
-        gpu.Type, gpu.GroupMarker, motion, state, SimConstants)
+        gpu.Type, gpu.GroupMarker, motion, state, SimConstants; packed = packed)
 
     # Corrector: every term, including the viscosity and density diffusion
     # models, is evaluated at the predictor state.
-    @phase HourGlass "08 Second NeighborLoop" timed launch_interactions!(
+    @phase HourGlass "06 Neighbour loop (corrector)" timed launch_interactions!(
         sup.dρdtI, gpu.Acceleration, gpu.Kernel, gpu.KernelGradient, sup.∇Cᵢ, sup.∇◌rᵢ,
         sup.Positionₙ⁺, sup.ρₙ⁺, sup.InvDensityₙ⁺, gpu.Pressure,
         sup.Velocityₙ⁺, gpu.Type, CellStart, gpu.CellID, grid, state,
         SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
         FlagKernel, FlagShift; threads = threads, lanes = lanes,
-        boundary_forces = bforces)
+        boundary_forces = bforces, packed = packed)
 
-    @phase HourGlass "11 Update To Final TimeStep" timed launch_final_step!(
+    @phase HourGlass "07 Final step" timed launch_final_step!(
         gpu.Position, gpu.Velocity, gpu.Acceleration, gpu.Density, gpu.Pressure,
         sup.dρdtI, sup.ρₙ⁺, sup.Positionₙ⁺, sup.Velocityₙ⁺, gpu.Type,
         sup.∇Cᵢ, sup.∇◌rᵢ, state, SimKernel, SimConstants, red, FlagShift)
 
-    @phase HourGlass "12 Update MetaData" timed launch_commit!(state)
+    @phase HourGlass "08 Commit step" timed launch_commit!(state)
     return nothing
 end
 
@@ -464,6 +471,109 @@ function sync_meta_data!(SimMetaData, state::StepState)
 end
 
 #---------------------------------------------------------------
+# Run statistics
+#---------------------------------------------------------------
+
+"""
+Time step history of a run: `Iteration, TotalTime, TimeStep, WallTime` as
+CSV, one line per host read back of the step state (so the resolution is one
+batch of at most `GPUMaxStepsPerSync` steps). `WallTime` is the wall clock
+time in seconds since the history was opened, at the start of the run. The
+file is flushed after every line so that an aborted run keeps its history.
+"""
+mutable struct TimeStepHistory
+    io::IOStream
+    path::String
+    t0::UInt64          # wall clock reference of the `WallTime` column
+    last_iteration::Int
+    dt_min::Float64
+    dt_max::Float64
+end
+
+function TimeStepHistory(path::AbstractString)
+    io = open(path, "w")
+    println(io, "Iteration,TotalTime,TimeStep,WallTime")
+    return TimeStepHistory(io, String(path), time_ns(), -1, Inf, -Inf)
+end
+
+Base.close(hist::TimeStepHistory) = close(hist.io)
+
+record_step!(::Nothing, SimMetaData) = nothing
+function record_step!(hist::TimeStepHistory, SimMetaData)
+    it = SimMetaData.Iteration
+    dt = Float64(SimMetaData.CurrentTimeStep)
+    (it > hist.last_iteration && dt > 0) || return nothing
+    hist.last_iteration = it
+    hist.dt_min = min(hist.dt_min, dt)
+    hist.dt_max = max(hist.dt_max, dt)
+    println(hist.io, it, ',', SimMetaData.TotalTime, ',', dt, ',', (time_ns() - hist.t0) / 1e9)
+    flush(hist.io)
+    return nothing
+end
+
+# Seconds accumulated in the timer section at `path` (nested labels), 0 if
+# the section was never entered.
+function section_seconds(hg::TimerOutput, path::AbstractString...)
+    node = hg
+    for label in path
+        haskey(node, label) || return 0.0
+        node = node[label]
+    end
+    return TimerOutputs.time(node) / 1e9
+end
+
+"""
+    run_summary(SimMetaData, HourGlass, gpu, cl, state, history, async_write_time, wall) -> Vector{String}
+
+Derived statistics of a finished run: time per step and particle steps per
+second, how often the cell list was rebuilt and the host read the step state
+back, and what the output cost (the asynchronous file writes overlap with the
+GPU and are listed separately from the time the host waited for them). `wall`
+is the wall clock time of `RunSimulation` in seconds.
+"""
+function run_summary(SimMetaData, HourGlass::TimerOutput, gpu, cl, state, hist::TimeStepHistory, async_write_time, wall)
+    n      = length(gpu)
+    steps  = SimMetaData.Iteration
+    total  = Float64(wall)
+    t_loop = section_seconds(HourGlass, "Simulation")
+    t_step = section_seconds(HourGlass, "Simulation", "Time steps")
+    t_reb  = section_seconds(HourGlass, "Simulation", "Cell list rebuild")
+    t_out  = section_seconds(HourGlass, "Output")
+    t_dl   = section_seconds(HourGlass, "Output", "Download from GPU")
+    t_wait = section_seconds(HourGlass, "Output", "Wait for previous write")
+    t_wr   = section_seconds(HourGlass, "Output", "Write files")
+    nout   = SimMetaData.OutputIterationCounter - 1     # outputs after the initial state
+    per(x, k) = k > 0 ? x / k : 0.0
+    pct(x, y) = y > 0 ? 100 * x / y : 0.0
+
+    lines = String[]
+    push!(lines, "Run summary")
+    push!(lines, @sprintf("  particles              : %d", n))
+    push!(lines, @sprintf("  time steps             : %d  (dt mean %.3e, min %.3e, max %.3e [s])",
+                          steps, per(Float64(SimMetaData.TotalTime), steps), hist.dt_min, hist.dt_max))
+    push!(lines, @sprintf("  stepping loop          : %.2f [s]  =  %.3f [ms/step],  %.3g M particle steps/s",
+                          t_loop, 1e3 * per(t_loop, steps), per(Float64(n) * steps, t_loop) / 1e6))
+    push!(lines, @sprintf("    GPU time steps       : %.2f [s]  (%.1f %% of the loop)", t_step, pct(t_step, t_loop)))
+    push!(lines, @sprintf("    cell list rebuilds   : %d, every %.1f steps, %.2f [ms] each  (%.1f %% of the loop), grid %s",
+                          cl.nrebuilds, per(steps, cl.nrebuilds), 1e3 * per(t_reb, cl.nrebuilds), pct(t_reb, t_loop),
+                          string(cl.grid.dims)))
+    push!(lines, @sprintf("    host read backs      : %d  (%.1f steps per read back, %d captured step graphs)",
+                          state.readbacks, per(steps, state.readbacks), length(state.graphs)))
+    push!(lines, @sprintf("  outputs                : %d, %.2f [s]  (%.1f %% of the total)", nout, t_out, pct(t_out, total)))
+    push!(lines, @sprintf("    download from GPU    : %.2f [s]  (%.1f [ms] each)", t_dl, 1e3 * per(t_dl, nout)))
+    if SimMetaData.GPUAsyncOutput
+        push!(lines, @sprintf("    file writes          : %.2f [s] on the output task, overlapped with the GPU; the host waited %.2f [s] for them",
+                              async_write_time, t_wait))
+    else
+        push!(lines, @sprintf("    file writes          : %.2f [s]  (synchronous)", t_wr))
+    end
+    push!(lines, @sprintf("  total wall time        : %.2f [s]  (stepping loop %.1f %%, output %.1f %%)",
+                          total, pct(t_loop, total), pct(t_out, total)))
+    push!(lines, "  time step history      : " * hist.path)
+    return lines
+end
+
+#---------------------------------------------------------------
 # Time loop
 #---------------------------------------------------------------
 
@@ -477,14 +587,16 @@ when the cell list has to be rebuilt and when the output time is reached; the
 host reacts to the read back state by rebuilding (`rebuild_cell_list!`) or
 returning. With `GPUUseGraph` a step is replayed as a CUDA graph.
 `GPUSyncTimers` forces one step per batch with a synchronization after every
-phase so that the timer output is meaningful.
+phase so that the kernels of a step are timed separately. `history` (a
+`TimeStepHistory`, or `nothing`) receives one line per read back.
 """
 function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
                         SimMetaData::SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode},
                         SimConstants, gpu::GPUParticles{Dimensions, FloatType},
                         cl::CellListWorkspace, sup::GPUSupportArrays, red::ReductionWorkspace,
-                        motion, state::StepState{FloatType}) where {Dimensions, FloatType, SMode, KMode, BMode, LMode,
-                                                                    SDD <: SPHDensityDiffusion, SV <: SPHViscosity}
+                        motion, state::StepState{FloatType},
+                        history::Union{Nothing, TimeStepHistory} = nothing) where {Dimensions, FloatType, SMode, KMode, BMode, LMode,
+                                                                                   SDD <: SPHDensityDiffusion, SV <: SPHViscosity}
     HourGlass = SimMetaData.HourGlass
     h = SimKernel.h
 
@@ -499,13 +611,15 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
     nlanes     = SimMetaData.GPULanesPerParticle
     lanes      = Val(nlanes <= 0 ? choose_lanes(length(gpu)) : nlanes)
     bforces    = Val(SimMetaData.GPUBoundaryForces)
+    # `nothing` selects the separate array loads at compile time.
+    packed     = SimMetaData.GPUPackedLayout ? sup.packed : nothing
 
     timed     = SimMetaData.GPUSyncTimers
     use_graph = SimMetaData.GPUUseGraph && !timed
     kmax      = timed ? 1 : max(1, SimMetaData.GPUMaxStepsPerSync)
 
     ctx = (; gpu, cl, sup, red, motion, state, SimKernel, SimConstants, SimDensityDiffusion, SimViscosity,
-             FlagKernel, FlagShift, UseMDBC, SingleNeighbor, threads, lanes, bforces, HourGlass)
+             FlagKernel, FlagShift, UseMDBC, SingleNeighbor, threads, lanes, bforces, packed, HourGlass)
 
     t_out = next_output_time(SimMetaData)
     set_output_time!(state, t_out)
@@ -522,29 +636,37 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
     generation = cl.generation
     while true
         K = batch_size(state, h, t_out, kmax)
-        @timeit HourGlass "03 Launch Steps" for _ in 1:K
-            if use_graph
-                launch_step_graph!(ctx)
-            else
-                enqueue_step!(ctx, timed)
+        # The launches return at once and the read back waits for the batch,
+        # so the section holds the GPU time of the steps (with `timed` the
+        # phases of the single step appear as its children).
+        @timeit HourGlass "Time steps" begin
+            for _ in 1:K
+                if use_graph
+                    launch_step_graph!(ctx)
+                else
+                    enqueue_step!(ctx, timed)
+                end
             end
-        end
-
-        @timeit HourGlass "13 Read Back State" begin
             readback!(state)
-            sync_meta_data!(SimMetaData, state)
         end
+        sync_meta_data!(SimMetaData, state)
+        record_step!(history, SimMetaData)
 
         stop = state.ih[I_STOP]
         if stop == STOP_REBUILD
-            @timeit HourGlass "02a Actual Calculate IndexCounter" begin
-                rebuild_cell_list!(gpu, cl, SimKernel.H⁻¹)
-                if cl.generation != generation
-                    # the cell start buffer was reallocated: cached graphs point at the old one
-                    invalidate_graphs!(state)
-                    generation = cl.generation
+            # Synchronized at the end so that the section holds the rebuild
+            # itself and not only its launches (one extra synchronization
+            # every few tens of steps).
+            @timeit HourGlass "Cell list rebuild" begin
+                @phase HourGlass "Sort and reorder" timed begin
+                    rebuild_cell_list!(gpu, cl, SimKernel.H⁻¹)
+                    if cl.generation != generation
+                        # the cell start buffer was reallocated: cached graphs point at the old one
+                        invalidate_graphs!(state)
+                        generation = cl.generation
+                    end
+                    resume_after_rebuild!(state)
                 end
-                resume_after_rebuild!(state)
 
                 # The single neighbour scheme carries `dρdtI` and the
                 # acceleration from the previous step, but the rebuild has
@@ -554,8 +676,9 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
                 # Before the first step this is the CPU "00 Init" evaluation,
                 # because the initial displacement bound forces a rebuild.
                 if SingleNeighbor
-                    enqueue_state_derivative!(ctx, state, timed, "02b Rebuild MDBC", "02c Rebuild NeighborLoop")
+                    enqueue_state_derivative!(ctx, state, timed, "mDBC after rebuild", "Neighbour loop after rebuild")
                 end
+                CUDA.synchronize()
             end
         elseif stop == STOP_OUTPUT || SimMetaData.TotalTime > t_out
             break
@@ -594,6 +717,7 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
     ) where {Dimensions, FloatType, SMode, KMode, BMode, LMode, SV <: SPHViscosity, SDD <: SPHDensityDiffusion}
 
     CUDA.functional() || error("CUDA is not functional on this machine; use the CPU package SPHExample instead.")
+    t_start = time_ns()
 
     (; HourGlass) = SimMetaData
 
@@ -604,8 +728,6 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
     # GPU at every output; the host arrays of the other fields stay untouched.
     output_vars     = resolve_output_variables!(SimMetaData)
     download_fields = Tuple(Symbol.(output_vars))
-
-    TimeSteps = Vector{FloatType}()
 
     if BMode === SimpleMDBC
         ParticleNormalsPath === nothing && error("SimpleMDBC requires `ParticleNormalsPath`.")
@@ -635,7 +757,7 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
     Pressure!(SimParticles.Pressure, SimParticles.Density, SimConstants)
 
     # Device side data
-    @timeit HourGlass "00a Upload To GPU" begin
+    @timeit HourGlass "Upload to GPU" begin
         gpu    = upload_particles(SimParticles)
         sup    = GPUSupportArrays{Dimensions, FloatType}(NumberOfPoints)
         red    = ReductionWorkspace{SVector{3, FloatType}}(NumberOfPoints)
@@ -650,7 +772,8 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
         CUDA.synchronize()
     end
 
-    output = SetupVTKOutput(SimMetaData, SimParticles, SimKernel, Dimensions)
+    output  = SetupVTKOutput(SimMetaData, SimParticles, SimKernel, Dimensions)
+    history = TimeStepHistory(joinpath(SimMetaData.SaveLocation, SimMetaData.SimulationName * "_TimeSteps.csv"))
 
     # Save initial state, use 1 else this cannot be used to index fid vector
     SimMetaData.OutputIterationCounter = 1
@@ -664,10 +787,8 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
     ]
 
     if !SimLogger.ToConsole
-        @timeit HourGlass "14 Next TimeStep" next!(
-            SimMetaData.ProgressSpecification;
-            showvalues = generate_showvalues(SimMetaData.Iteration, SimMetaData.TotalTime, 1e6),
-        )
+        next!(SimMetaData.ProgressSpecification;
+              showvalues = generate_showvalues(SimMetaData.Iteration, SimMetaData.TotalTime, 1e6))
     end
 
     # Output is written by a task so that the GPU can already continue with
@@ -684,9 +805,8 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
     end
 
     while true
-        @timeit HourGlass "00 SimulationLoop" SimulationLoop(SimDensityDiffusion, SimViscosity, SimKernel, SimMetaData,
-                                                             SimConstants, gpu, cl, sup, red, motion, state)
-        push!(TimeSteps, SimMetaData.CurrentTimeStep)
+        @timeit HourGlass "Simulation" SimulationLoop(SimDensityDiffusion, SimViscosity, SimKernel, SimMetaData,
+                                                      SimConstants, gpu, cl, sup, red, motion, state, history)
 
         if StoreLogOutput
             LogStep(SimLogger, SimMetaData, HourGlass)
@@ -694,74 +814,72 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
         end
 
         SimMetaData.OutputIterationCounter += 1
-
-        @timeit HourGlass "13 Download From GPU" begin
-            wait_for_output()
-            cid = download_particles!(SimParticles, gpu, cl.grid, download_fields;
-                                      cells = SimMetaData.ExportGridCells)
-        end
-
-        UniqueCells = SimMetaData.ExportGridCells ? unique_cells_host(cl.grid, cid) : CartesianIndex{Dimensions}[]
-        SimMetaData.IndexCounter = length(UniqueCells)
-
         counter = SimMetaData.OutputIterationCounter
         t_out   = SimMetaData.TotalTime
-        if SimMetaData.GPUAsyncOutput
-            write_task = Threads.@spawn begin
-                t0 = time()
-                output.save_particles(counter, t_out)
-                output.save_grid(counter, UniqueCells, SimParticles, t_out)
-                time() - t0
+
+        @timeit HourGlass "Output" begin
+            # Time the host is blocked on the previous asynchronous write: if
+            # this grows, the output rather than the GPU limits the run.
+            @timeit HourGlass "Wait for previous write" wait_for_output()
+            cid = @timeit HourGlass "Download from GPU" download_particles!(
+                SimParticles, gpu, cl.grid, download_fields; cells = SimMetaData.ExportGridCells)
+            UniqueCells = if SimMetaData.ExportGridCells
+                @timeit HourGlass "Cell grid export" unique_cells_host(cl.grid, cid)
+            else
+                CartesianIndex{Dimensions}[]
             end
-        else
-            @timeit HourGlass "13A Save Particle Data" output.save_particles(counter, t_out)
-            @timeit HourGlass "13A Save CellGrid Data" output.save_grid(counter, UniqueCells, SimParticles, t_out)
+            SimMetaData.IndexCounter = length(UniqueCells)
+
+            if SimMetaData.GPUAsyncOutput
+                write_task = Threads.@spawn begin
+                    t0 = time()
+                    output.save_particles(counter, t_out)
+                    output.save_grid(counter, UniqueCells, SimParticles, t_out)
+                    time() - t0
+                end
+            else
+                @timeit HourGlass "Write files" begin
+                    output.save_particles(counter, t_out)
+                    output.save_grid(counter, UniqueCells, SimParticles, t_out)
+                end
+            end
         end
 
         if !SimLogger.ToConsole
             TimeLeftInSeconds = (SimMetaData.SimulationTime - SimMetaData.TotalTime) *
                                 (TimerOutputs.tottime(HourGlass) / 1e9 / SimMetaData.TotalTime)
-            @timeit HourGlass "14 Next TimeStep" next!(
-                SimMetaData.ProgressSpecification;
-                showvalues = generate_showvalues(SimMetaData.Iteration, SimMetaData.TotalTime, TimeLeftInSeconds),
-            )
+            next!(SimMetaData.ProgressSpecification;
+                  showvalues = generate_showvalues(SimMetaData.Iteration, SimMetaData.TotalTime, TimeLeftInSeconds))
         end
 
         if SimMetaData.TotalTime > SimMetaData.SimulationTime
-            @timeit HourGlass "13B Close Data Streams" begin
-                wait_for_output()
-                output.close_files()
+            @timeit HourGlass "Finalize" begin
+                @timeit HourGlass "Wait for previous write" wait_for_output()
+                @timeit HourGlass "Close files" output.close_files()
+                # Leave the complete final state on the host, not only the
+                # output fields, so that callers can inspect every particle field.
+                @timeit HourGlass "Download from GPU" download_particles!(SimParticles, gpu, cl.grid; cells = true)
+                close(history)
             end
-
-            # Leave the complete final state on the host, not only the output
-            # fields, so that callers can inspect every particle field.
-            @timeit HourGlass "13 Download From GPU" download_particles!(SimParticles, gpu, cl.grid; cells = true)
 
             if !SimLogger.ToConsole
                 finish!(SimMetaData.ProgressSpecification)
             end
-            show(HourGlass, sortby = :name)
-            show(HourGlass)
+
+            summary = run_summary(SimMetaData, HourGlass, gpu, cl, state, history, async_write_time,
+                                  (time_ns() - t_start) / 1e9)
+            print_timer(HourGlass; sortby = :name)
+            println()
+            foreach(println, summary)
 
             AutoOpenParaview(SimMetaData, output.variable_names)
 
-            UnicodeTimeStepsGraph = lineplot(1:length(TimeSteps), TimeSteps, title = "Time Steps [s] as a function of iteration",
-                                             name = "Time Steps", xlabel = "Iterations [-]", ylabel = "Time Step Size [s]")
-
             if StoreLogOutput
-                with_logger(SimLogger.Logger) do
-                    @info "Cell list rebuilds: $(cl.nrebuilds), grid dims: $(cl.grid.dims)"
-                    @info "Host read backs of the step state: $(state.readbacks) for $(SimMetaData.Iteration) steps, " *
-                          "captured step graphs: $(length(state.graphs))"
-                    @info @sprintf("Asynchronous output write time (overlapped with GPU work): %.2f [s]", async_write_time)
-                end
                 LogFinal(SimLogger, HourGlass)
-
                 with_logger(SimLogger.Logger) do
                     @info ""
-                    show(SimLogger.LoggerIo, UnicodeTimeStepsGraph)
+                    @info join(summary, '\n')
                 end
-
                 close(SimLogger.LoggerIo)
                 AutoOpenLogFile(SimLogger, SimMetaData)
             end

@@ -219,9 +219,10 @@ module SimulationLoggerConfiguration
 
             @info formatted_time
             @info "\n Simulation took " * @sprintf("%-.2f", TimerOutputs.tottime(HourGlass)/1e9) * "[s]"
-            show(SimLogger.LoggerIo, HourGlass,sortby=:name)
+            # Plain text file: no heat bars.
+            print_timer(SimLogger.LoggerIo, HourGlass; sortby = :name, bars = false)
             @info "\n Sorted by time \n"
-            show(SimLogger.LoggerIo, HourGlass)
+            print_timer(SimLogger.LoggerIo, HourGlass; bars = false)
         end
     end
 

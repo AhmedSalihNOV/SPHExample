@@ -206,8 +206,6 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
 
             CellData = HDF5.create_group(root, "CellData")
             HDF5.create_dataset(CellData, "CellData" , idType , ((0,),(-1,)), chunk=(chunk_size,))
-
-            HDF5.create_dataset(CellData, "ChunkID" , idType , ((0,),(-1,)), chunk=(chunk_size,))
         end
 
         return nothing
@@ -405,11 +403,6 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
         HDF5.set_extent_dims(root["CellData"]["CellData"], (length(root["CellData"]["CellData"]) + length(UniqueCells),))
         root["CellData"]["CellData"][CellDataStartIndex:end] = cell_data
 
-        
-        CellChunkIDIndex = length(root["CellData"]["ChunkID"]) + 1
-        HDF5.set_extent_dims(root["CellData"]["ChunkID"], (length(root["CellData"]["ChunkID"]) + length(UniqueCells),))
-        root["CellData"]["ChunkID"][CellChunkIDIndex:end] = SimParticles.ChunkID[1:length(cell_data)]
-
         return nothing
     end
 
@@ -468,14 +461,44 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
         grid_filename = (iter) -> "$(grid_savepath)_$(lpad(iter,6,"0")).vtkhdf"
         
         output_vars = SimMetaData.OutputVariables
+
+        # Host array written for an output variable. In 2D the vector fields are
+        # widened to three components into a buffer, allocated only for the
+        # fields that are actually written.
+        vector_fields = ("KernelGradient", "Velocity", "Acceleration", "GhostPoints", "GhostNormals")
+        T = eltype(eltype(SimParticles.Position))
+        n = length(SimParticles.Position)
+        widen    = Dimensions == 2
+        pos_buf  = widen ? Vector{SVector{3, T}}(undef, n) : nothing
+        vec_bufs = Dict{String, Vector{SVector{3, T}}}(
+            name => Vector{SVector{3, T}}(undef, n) for name in output_vars if widen && name in vector_fields)
+        function output_field(name)
+            name == "Type" && return Int8.(SimParticles.Type)
+            src = getproperty(SimParticles, Symbol(name))
+            buf = get(vec_bufs, name, nothing)
+            buf === nothing && return src
+            to_3d!(buf, src)
+            return buf
+        end
+        function output_position()
+            widen || return SimParticles.Position
+            to_3d!(pos_buf, SimParticles.Position)
+            return pos_buf
+        end
     
         # Initialize storage for file handles
         file_handles = if !SimMetaData.ExportSingleVTKHDF
             # Multi-file mode: vector for particle files
+            # Frames written: the initial state plus one per output deadline.
+            # Deadlines are clamped to `SimulationTime` (see `next_output_time`),
+            # so a final frame lands on the end time even when it is not a
+            # multiple of the interval or not listed in the schedule. One spare
+            # slot guards against floating point rounding of the ratio;
+            # `close_files` skips unassigned slots.
             n_outputs = if SimMetaData.OutputTimes isa AbstractVector
-                length(SimMetaData.OutputTimes) + 1
+                count(t -> t < SimMetaData.SimulationTime, SimMetaData.OutputTimes) + 2
             else
-                Int(SimMetaData.SimulationTime/SimMetaData.OutputTimes + 1)
+                ceil(Int, SimMetaData.SimulationTime / SimMetaData.OutputTimes) + 2
             end
             (
                 particle_files = Vector{HDF5.File}(undef, n_outputs),
@@ -486,22 +509,7 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
             OutputVTKHDF = h5open("$(particle_savepath).vtkhdf", "w")
             root = HDF5.create_group(OutputVTKHDF, "VTKHDF")
             
-            available_init = Dict(
-                "ChunkID" => SimParticles.ChunkID,
-                "Kernel" => SimParticles.Kernel,
-                "KernelGradient" => SimParticles.KernelGradient,
-                "Density" => SimParticles.Density,
-                "Pressure" => SimParticles.Pressure,
-                "Velocity" => SimParticles.Velocity,
-                "Acceleration" => SimParticles.Acceleration,
-                "BoundaryBool" => SimParticles.BoundaryBool,
-                "ID" => SimParticles.ID,
-                "Type" => Int8.(SimParticles.Type),
-                "GroupMarker" => SimParticles.GroupMarker,
-                "GhostPoints" => SimParticles.GhostPoints,
-                "GhostNormals" => SimParticles.GhostNormals,
-            )
-            output_data_init = [available_init[name] for name in output_vars]
+            output_data_init = [output_field(name) for name in output_vars]
 
             GenerateGeometryStructure(root, output_vars, output_data_init...; chunk_size=1024)
             GenerateStepStructure(root, output_vars, output_data_init...)
@@ -519,63 +527,11 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
             end
         end
 
-        # Buffers used when converting 2D particle data to 3D
-        pos_buf = kgrad_buf = vel_buf = acc_buf = gp_buf = gn_buf = nothing
-        if Dimensions == 2
-            T = eltype(eltype(SimParticles.Position))
-            n = length(SimParticles.Position)
-            pos_buf   = Vector{SVector{3,T}}(undef, n)
-            kgrad_buf = Vector{SVector{3,T}}(undef, n)
-            vel_buf   = Vector{SVector{3,T}}(undef, n)
-            acc_buf   = Vector{SVector{3,T}}(undef, n)
-            gp_buf    = Vector{SVector{3,T}}(undef, n)
-            gn_buf    = Vector{SVector{3,T}}(undef, n)
-            fill_buffers!() = begin
-                to_3d!(pos_buf,   SimParticles.Position)
-                to_3d!(kgrad_buf, SimParticles.KernelGradient)
-                to_3d!(vel_buf,   SimParticles.Velocity)
-                to_3d!(acc_buf,   SimParticles.Acceleration)
-                to_3d!(gp_buf,    SimParticles.GhostPoints)
-                to_3d!(gn_buf,    SimParticles.GhostNormals)
-            end
-        end
-
         # Main saving functions. `time` is passed explicitly so that a writer
         # running asynchronously stamps the step with the time of the download.
         function save_particle_data(iteration, time = SimMetaData.TotalTime)
-            if Dimensions == 2
-                fill_buffers!()
-                pos   = pos_buf
-                kgrad = kgrad_buf
-                vel   = vel_buf
-                acc   = acc_buf
-                gp    = gp_buf
-                gn    = gn_buf
-            else
-                pos = SimParticles.Position
-                kgrad = SimParticles.KernelGradient
-                vel = SimParticles.Velocity
-                acc = SimParticles.Acceleration
-                gp  = SimParticles.GhostPoints
-                gn  = SimParticles.GhostNormals
-            end
-
-            available = Dict(
-                "ChunkID" => SimParticles.ChunkID,
-                "Kernel" => SimParticles.Kernel,
-                "KernelGradient" => kgrad,
-                "Density" => SimParticles.Density,
-                "Pressure" => SimParticles.Pressure,
-                "Velocity" => vel,
-                "Acceleration" => acc,
-                "BoundaryBool" => SimParticles.BoundaryBool,
-                "ID" => SimParticles.ID,
-                "Type" => Int8.(SimParticles.Type),
-                "GroupMarker" => SimParticles.GroupMarker,
-                "GhostPoints" => gp,
-                "GhostNormals" => gn,
-            )
-            output_data = [available[name] for name in output_vars]
+            pos         = output_position()
+            output_data = [output_field(name) for name in output_vars]
 
             if !SimMetaData.ExportSingleVTKHDF
                 SaveVTKHDF(file_handles.particle_files, iteration, particle_filename(iteration),
@@ -600,7 +556,9 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
         function close_files()
             if !SimMetaData.ExportSingleVTKHDF
                 # Close all particle files in multi-file mode
-                for f in file_handles.particle_files
+                for i in eachindex(file_handles.particle_files)
+                    isassigned(file_handles.particle_files, i) || continue
+                    f = file_handles.particle_files[i]
                     isopen(f) && close(f)
                 end
             else

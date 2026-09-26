@@ -10,6 +10,10 @@
 # Note: on Julia 1.12 use `-t N,0` rather than `-t auto`; `-t auto` adds an
 # interactive thread and the CPU code indexes its per thread arrays with
 # `threadid()`, which then exceeds `nthreads()`.
+#
+# The CPU checkout must provide the mode type API (`SimulationMetaData` with
+# shifting/kernel output/mDBC/log type parameters and the `SimTimeStepping`
+# keyword of `RunSimulation`), which `cases.jl` constructs against.
 
 using SPHExample
 using TimerOutputs
@@ -26,11 +30,11 @@ function run_case(case::BenchCase, ::Type{T}; warmup = false) where {T}
         kw.SimMetaData.SimulationTime = T(1e-7)
         kw.SimMetaData.OutputTimes    = T(1e-7)
     end
-    particles = AllocateDataStructures(kw.SimGeometry)
+    particles = AllocateDataStructures(kw.SimGeometry, kw.SimMetaData)
     logger    = SimulationLogger(save; to_console=false)
     RunSimulation(; kw..., SimLogger=logger, SimParticles=particles)
     hg    = kw.SimMetaData.HourGlass
-    loop  = TimerOutputs.time(hg["00 SimulationLoop"]) / 1e9
+    loop  = loop_time(hg)
     total = TimerOutputs.tottime(hg) / 1e9
     iters = kw.SimMetaData.Iteration
     return (n=length(particles), iters=iters, loop=loop, total=total)

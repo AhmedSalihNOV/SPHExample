@@ -31,10 +31,8 @@ let
 
     SimulationGeometry = [FixedBoundary;Water]
     
-    # Load in particles
-    SimParticles = AllocateDataStructures(SimulationGeometry)
 
-    SimMetaDataWedge  = SimulationMetaData{Dimensions,FloatType}(
+    SimMetaDataWedge  = SimulationMetaData{Dimensions,FloatType,NoShifting,NoKernelOutput,SimpleMDBC,StoreLog}(
         SimulationName="CaseDuckling", 
         SaveLocation="C:/TestSimulations/Duckling_GPU",
         SimulationTime=1,
@@ -43,10 +41,6 @@ let
         ExportSingleVTKHDF=true,
         ExportGridCells= true,
         OpenLogFile=true,
-        FlagOutputKernelValues=false,
-        FlagLog=true,
-        FlagShifting=false,
-        FlagMDBCSimple=true,
     )
 
     SimKernel           = SPHKernelInstance{Dimensions, FloatType}(WendlandC2(); dx = SimConstantsWedge.dx, k = FloatType(1.5))
@@ -56,6 +50,7 @@ let
     mkpath(SimMetaDataWedge.SaveLocation)
 
     SimLogger = SimulationLogger(SimMetaDataWedge.SaveLocation)
+    SimParticles = AllocateDataStructures(SimulationGeometry, SimMetaDataWedge)
 
     CleanUpSimulationFolder(SimMetaDataWedge.SaveLocation)
 
@@ -69,6 +64,7 @@ let
         SimKernel           = SimKernel,
         SimViscosity        = SimViscosity,
         SimDensityDiffusion = SimDensityDiffusion,
+        SimTimeStepping     = SymplecticTimeStepping(),
         ParticleNormalsPath = "./input/case_duckling_mdbc/CaseDuckling_Dp$(SimConstantsWedge.dx)_GhostNodes.csv"
     )
 

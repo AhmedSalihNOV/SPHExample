@@ -12,8 +12,8 @@ let
     Dimensions = 2
     FloatType  = Float32
 
-    SimConstantsWedge = SimulationConstants{FloatType}(dx=0.02,c₀=42.48576250492629, δᵩ = 0.1, CFL=0.5)
-    # SimConstantsWedge = SimulationConstants{FloatType}(dx=0.01,c₀=43.4, δᵩ = 0.1, CFL=0.2)
+    # SimConstantsWedge = SimulationConstants{FloatType}(dx=0.02,c₀=42.48576250492629, δᵩ = 0.1, CFL=0.5)
+    SimConstantsWedge = SimulationConstants{FloatType}(dx=0.01,c₀=43.4, δᵩ = 0.1, CFL=0.2)
 # 
     # Assuming SimConstantsWedge is defined somewhere else with the field `dx`
     FixedBoundary = Geometry{Dimensions, FloatType}(
@@ -32,10 +32,8 @@ let
 
     SimulationGeometry = [FixedBoundary;Water]
     
-    # Load in particles
-    SimParticles = AllocateDataStructures(SimulationGeometry)
 
-    SimMetaDataWedge  = SimulationMetaData{Dimensions,FloatType}(
+    SimMetaDataWedge  = SimulationMetaData{Dimensions,FloatType,NoShifting,NoKernelOutput,NoMDBC,StoreLog}(
         SimulationName="StillWedge", 
         SaveLocation="C:/TestSimulations/StillWedge2D_MDBC_GPU",
         SimulationTime=4.0,
@@ -44,9 +42,6 @@ let
         ExportSingleVTKHDF=true,
         ExportGridCells=true,
         OpenLogFile=true,
-        FlagOutputKernelValues=false,
-        FlagLog=true,
-        FlagMDBCSimple=false,
         # OutputVariables = [
         #     # "ChunkID",
         #     # "Kernel",
@@ -67,6 +62,7 @@ let
     mkpath(SimMetaDataWedge.SaveLocation)
 
     SimLogger = SimulationLogger(SimMetaDataWedge.SaveLocation; to_console=true)
+    SimParticles = AllocateDataStructures(SimulationGeometry, SimMetaDataWedge)
 
     CleanUpSimulationFolder(SimMetaDataWedge.SaveLocation)
 
@@ -81,6 +77,7 @@ let
         SimParticles        = SimParticles,
         SimViscosity        = ArtificialViscosity(),
         SimDensityDiffusion = LinearDensityDiffusion(),
+        SimTimeStepping     = SymplecticTimeStepping(),
         ParticleNormalsPath = "./input/still_wedge_mdbc/StillWedge_Dp$(SimConstantsWedge.dx)_GhostNodes_Correct.csv"
     )
 

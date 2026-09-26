@@ -299,16 +299,22 @@ Advance the simulation on the GPU until the next output time. Mirrors the CPU
 `SimulationLoop` step for step; see `GPUKernels` for the fused kernels.
 """
 function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
-                        SimMetaData::SimulationMetaData{Dimensions, FloatType},
+                        SimMetaData::SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode},
                         SimConstants, gpu::GPUParticles{Dimensions, FloatType},
                         cl::CellListWorkspace, sup::GPUSupportArrays, red::ReductionWorkspace,
-                        motion) where {Dimensions, FloatType, SDD <: SPHDensityDiffusion, SV <: SPHViscosity}
+                        motion) where {Dimensions, FloatType, SMode, KMode, BMode, LMode,
+                                       SDD <: SPHDensityDiffusion, SV <: SPHViscosity}
     HourGlass = SimMetaData.HourGlass
     (; CFL, c₀) = SimConstants
     h = SimKernel.h
 
-    FlagKernel = Val(SimMetaData.FlagOutputKernelValues)
-    FlagShift  = Val(SimMetaData.FlagShifting)
+    # The mode type parameters of the meta data select the kernel variants at
+    # compile time; the time stepping scheme is a run time field set by
+    # `RunSimulation`.
+    FlagKernel     = Val(KMode === StoreKernelOutput)
+    FlagShift      = Val(SMode === PlanarShifting)
+    UseMDBC        = BMode === SimpleMDBC
+    SingleNeighbor = SimMetaData.TimeSteppingMode isa SingleNeighborTimeStepping
     threads    = SimMetaData.GPUInteractionThreads
     nlanes     = SimMetaData.GPULanesPerParticle
     lanes      = Val(nlanes <= 0 ? choose_lanes(length(gpu)) : nlanes)
@@ -353,8 +359,8 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
             end
         end
 
-        if !SimMetaData.FlagSingleStepTimeStepping
-            if SimMetaData.FlagMDBCSimple
+        if !SingleNeighbor
+            if UseMDBC
                 @timeit HourGlass "04a First NeighborLoopMDBC" begin
                     launch_mdbc!(gpu.Density, gpu.Position, gpu.GhostPoints, gpu.Type, CellStart, grid,
                                  SimKernel, SimConstants; threads = threads, lanes = lanes)
@@ -416,31 +422,39 @@ end
 
 """
     RunSimulation(; SimGeometry, SimMetaData, SimConstants, SimKernel, SimLogger,
-                    SimParticles, SimViscosity, SimDensityDiffusion, ParticleNormalsPath)
+                    SimParticles, SimViscosity, SimDensityDiffusion, SimTimeStepping,
+                    ParticleNormalsPath)
 
-Run a complete simulation on the GPU. Same interface as the CPU version. On
-return the host `SimParticles` hold the final state (reordered by cell, like
-the CPU version).
+Run a complete simulation on the GPU. Same interface as the CPU version: the
+shifting, kernel output, mDBC and log modes are the type parameters of
+`SimMetaData`, the time stepping scheme is `SimTimeStepping`
+(`SymplecticTimeStepping()` or `SingleNeighborTimeStepping()`). On return the
+host `SimParticles` hold the final state (reordered by cell, like the CPU
+version).
 """
 function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
-    SimMetaData::SimulationMetaData{Dimensions, FloatType},
+    SimMetaData::SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode},
     SimConstants::SimulationConstants,
     SimKernel::SPHKernelInstance,
     SimLogger::SimulationLogger,
     SimParticles::StructArray,
     SimViscosity::SV,
     SimDensityDiffusion::SDD,
+    SimTimeStepping::TimeSteppingMode,
     ParticleNormalsPath::Union{Nothing, String} = nothing
-    ) where {Dimensions, FloatType, SV <: SPHViscosity, SDD <: SPHDensityDiffusion}
+    ) where {Dimensions, FloatType, SMode, KMode, BMode, LMode, SV <: SPHViscosity, SDD <: SPHDensityDiffusion}
 
     CUDA.functional() || error("CUDA is not functional on this machine; use the CPU package SPHExample instead.")
 
     (; HourGlass) = SimMetaData
 
+    SimMetaData.TimeSteppingMode = SimTimeStepping
+    StoreLogOutput = LMode === StoreLog
+
     TimeSteps = Vector{FloatType}()
 
-    if SimMetaData.FlagMDBCSimple
-        ParticleNormalsPath === nothing && error("FlagMDBCSimple requires `ParticleNormalsPath`.")
+    if BMode === SimpleMDBC
+        ParticleNormalsPath === nothing && error("SimpleMDBC requires `ParticleNormalsPath`.")
         _, GhostPoints, GhostNormals = LoadBoundaryNormals(Val(Dimensions), FloatType, ParticleNormalsPath)
         for gi ∈ eachindex(GhostPoints)
             SimParticles.GhostPoints[gi]  = GhostPoints[gi]
@@ -448,7 +462,7 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
         end
     end
 
-    if SimMetaData.FlagLog
+    if StoreLogOutput
         InitializeLogger(SimLogger, SimConstants, SimMetaData, SimKernel, SimViscosity, SimDensityDiffusion, SimGeometry, SimParticles)
         with_logger(SimLogger.Logger) do
             dev = CUDA.device()
@@ -458,7 +472,7 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
         end
     end
 
-    if SimMetaData.FlagLog
+    if StoreLogOutput
         LogStep(SimLogger, SimMetaData, HourGlass)
         SimMetaData.StepsTakenForLastOutput = SimMetaData.Iteration
     end
@@ -515,7 +529,7 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
                                                              SimConstants, gpu, cl, sup, red, motion)
         push!(TimeSteps, SimMetaData.CurrentTimeStep)
 
-        if SimMetaData.FlagLog
+        if StoreLogOutput
             LogStep(SimLogger, SimMetaData, HourGlass)
             SimMetaData.StepsTakenForLastOutput = SimMetaData.Iteration
         end
@@ -570,7 +584,7 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
             UnicodeTimeStepsGraph = lineplot(1:length(TimeSteps), TimeSteps, title = "Time Steps [s] as a function of iteration",
                                              name = "Time Steps", xlabel = "Iterations [-]", ylabel = "Time Step Size [s]")
 
-            if SimMetaData.FlagLog
+            if StoreLogOutput
                 with_logger(SimLogger.Logger) do
                     @info "Cell list rebuilds: $(cl.nrebuilds), grid dims: $(cl.grid.dims)"
                     @info @sprintf("Asynchronous output write time (overlapped with GPU work): %.2f [s]", async_write_time)

@@ -7,6 +7,10 @@
 #
 # (`-t N,0` avoids the interactive thread that Julia 1.12 adds with `-t auto`,
 #  which the CPU code does not account for.)
+#
+# The CPU checkout must provide the mode type API (type parameterised
+# `SimulationMetaData`, `SimTimeStepping` keyword of `RunSimulation`) that the
+# shared `cases.jl` constructs against.
 
 using SPHExample
 using HDF5
@@ -25,7 +29,7 @@ function main(args)
     kw   = case.build(Float64, save)
     kw.SimMetaData.SimulationTime = simtime
     kw.SimMetaData.OutputTimes    = simtime
-    particles = AllocateDataStructures(kw.SimGeometry)
+    particles = AllocateDataStructures(kw.SimGeometry, kw.SimMetaData)
     logger    = SimulationLogger(save; to_console = false)
     RunSimulation(; kw..., SimLogger = logger, SimParticles = particles)
 

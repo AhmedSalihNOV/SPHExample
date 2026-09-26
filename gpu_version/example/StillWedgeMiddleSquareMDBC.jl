@@ -32,10 +32,8 @@ let
 # 
     SimulationGeometry = [FixedBoundary;Water]
     
-    # Load in particles
-    SimParticles = AllocateDataStructures(SimulationGeometry)
 
-    SimMetaDataWedge  = SimulationMetaData{Dimensions,FloatType}(
+    SimMetaDataWedge  = SimulationMetaData{Dimensions,FloatType,NoShifting,NoKernelOutput,SimpleMDBC,StoreLog}(
         SimulationName="StillWedge", 
         SaveLocation="C:/TestSimulations/StillWedgeMiddleSquare2D_MDBC_GPU",
         SimulationTime=4,
@@ -43,10 +41,7 @@ let
         VisualizeInParaview=true,
         ExportSingleVTKHDF=true,
         ExportGridCells=true,
-        OpenLogFile=true,
-        FlagOutputKernelValues=false,
-        FlagLog=true,
-        FlagMDBCSimple=true
+        OpenLogFile=true
     )
 
     # If save directory is not already made, make it
@@ -55,6 +50,7 @@ let
     end
 
     SimLogger = SimulationLogger(SimMetaDataWedge.SaveLocation)
+    SimParticles = AllocateDataStructures(SimulationGeometry, SimMetaDataWedge)
 
     CleanUpSimulationFolder(SimMetaDataWedge.SaveLocation)
 
@@ -69,6 +65,7 @@ let
         SimParticles        = SimParticles,
         SimViscosity        = ArtificialViscosity(),
         SimDensityDiffusion = LinearDensityDiffusion(),
+        SimTimeStepping     = SymplecticTimeStepping(),
         ParticleNormalsPath = "./input/still_wedge_middle_square_mdbc/StillWedge_MiddleSquare_Dp$(SimConstantsWedge.dx)_GhostNodes.csv"
     )
 

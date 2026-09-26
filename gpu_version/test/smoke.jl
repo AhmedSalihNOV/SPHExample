@@ -15,7 +15,7 @@ function smoke(case::BenchCase, ::Type{T}; simtime = nothing, sync = false) wher
         kw.SimMetaData.OutputTimes    = T(simtime / 2)
     end
     kw.SimMetaData.GPUSyncTimers = sync
-    particles = AllocateDataStructures(kw.SimGeometry)
+    particles = AllocateDataStructures(kw.SimGeometry, kw.SimMetaData)
     logger    = SimulationLogger(save; to_console = false)
     RunSimulation(; kw..., SimLogger = logger, SimParticles = particles)
     @printf("%s %s: %d particles, %d steps, TotalTime=%.4f, ρ range = [%.3f, %.3f], max|v| = %.4f\n",

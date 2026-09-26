@@ -38,10 +38,9 @@ let
     SimulationGeometry = [FixedBoundary; Water]
 
     # --- Allocate particles ---
-    SimParticles = AllocateDataStructures(SimulationGeometry)
 
     # --- Simulation metadata & logging ---
-    SimMetaDataDambreak3D = SimulationMetaData{Dimensions,FloatType}(
+    SimMetaDataDambreak3D = SimulationMetaData{Dimensions,FloatType,NoShifting,NoKernelOutput,NoMDBC,StoreLog}(
         SimulationName         = "DamBreak3D_Test",
         SaveLocation           = "C:/TestSimulations/DamBreak3D_GPU",
         SimulationTime         = 1.6,
@@ -49,9 +48,7 @@ let
         VisualizeInParaview    = true,
         ExportSingleVTKHDF     = true,
         ExportGridCells        = true,
-        OpenLogFile            = true,
-        FlagOutputKernelValues = false,
-        FlagLog                = true
+        OpenLogFile            = true
     )
 
     if !isdir(SimMetaDataDambreak3D.SaveLocation)
@@ -59,6 +56,7 @@ let
     end
 
     SimLogger = SimulationLogger(SimMetaDataDambreak3D.SaveLocation; to_console=true)
+    SimParticles = AllocateDataStructures(SimulationGeometry, SimMetaDataDambreak3D)
 
     @warn("""
     3D mode enabled but lightly tested.
@@ -81,6 +79,7 @@ let
         SimLogger          = SimLogger,
         SimParticles       = SimParticles,
         SimViscosity       = SimViscosity,
-        SimDensityDiffusion= SimDensityDiffusion
+        SimDensityDiffusion= SimDensityDiffusion,
+        SimTimeStepping    = SymplecticTimeStepping()
     )
 end

@@ -23,17 +23,14 @@ let
         CFL=0.2
     )
 
-    SimMetaDataMovingSquare  = SimulationMetaData{Dimensions,FloatType}(
+    SimMetaDataMovingSquare  = SimulationMetaData{Dimensions,FloatType,PlanarShifting,NoKernelOutput,NoMDBC,StoreLog}(
         SimulationName="MovingSquare2D", 
         SaveLocation="C:/TestSimulations/MovingSquare2D_GPU",
         SimulationTime=2.5,
         OutputTimes=0.01,
         VisualizeInParaview=true,
         ExportSingleVTKHDF=true,
-        OpenLogFile=true,
-        FlagOutputKernelValues=false,
-        FlagLog=true,
-        FlagShifting=true
+        OpenLogFile=true
     )
     FixedBoundary = Geometry{Dimensions, FloatType}(
         CSVFile     = "./input/moving_square_2d/MovingSquare_Dp$(SimConstantsMovingSquare.dx)_Fixed.csv",
@@ -63,8 +60,6 @@ let
 
     SimulationGeometry = [FixedBoundary;Water;MovingSquare]
 
-    # Load in particles
-    SimParticles = AllocateDataStructures(SimulationGeometry)
     
     # Collect Geometry instances into a vector
     SimulationGeometry = [FixedBoundary, Water, MovingSquare]
@@ -74,6 +69,7 @@ let
     end
 
     SimLogger = SimulationLogger(SimMetaDataMovingSquare.SaveLocation; to_console=true)
+    SimParticles = AllocateDataStructures(SimulationGeometry, SimMetaDataMovingSquare)
 
     SimKernel = SPHKernelInstance{Dimensions, FloatType}(WendlandC2(); dx = SimConstantsMovingSquare.dx, k  = FloatType(sqrt(2)))
 
@@ -87,6 +83,7 @@ let
         SimParticles        = SimParticles,
         SimKernel           = SimKernel,
         SimViscosity        = LaminarSPS(),
-        SimDensityDiffusion = ZeroGravityLinearDensityDiffusion()
+        SimDensityDiffusion = ZeroGravityLinearDensityDiffusion(),
+        SimTimeStepping     = SymplecticTimeStepping()
     )
 end

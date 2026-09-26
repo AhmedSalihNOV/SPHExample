@@ -10,10 +10,13 @@ include(joinpath(@__DIR__, "..", "benchmark", "cases.jl"))
 
 # Project of the CPU package used as the reference. Defaults to the repository
 # containing `gpu_version`; set `SPHEXAMPLE_CPU_REF` to compare against another
-# checkout (e.g. a branch of the CPU code).
+# checkout (e.g. a branch of the CPU code). The shared cases construct the meta
+# data with mode type parameters, so the CPU checkout must provide that API.
 const REPO      = normpath(get(ENV, "SPHEXAMPLE_CPU_REF", joinpath(@__DIR__, "..", "..")))
 const CPU_REF   = joinpath(@__DIR__, "cpu_reference.jl")
-const HAVE_CPU  = isfile(joinpath(REPO, "src", "SPHExample.jl"))
+const CPU_META  = joinpath(REPO, "src", "SimulationMetaDataConfiguration.jl")
+const HAVE_CPU  = isfile(joinpath(REPO, "src", "SPHExample.jl")) && isfile(CPU_META) &&
+                  occursin("TimeSteppingMode", read(CPU_META, String))
 
 """
 Run `case` on the GPU for `simtime` seconds of physical time and return the
@@ -27,7 +30,7 @@ function run_gpu(case::BenchCase, ::Type{T}, simtime; kwargs...) where {T}
     for (k, v) in kwargs
         setproperty!(kw.SimMetaData, k, v)
     end
-    particles = AllocateDataStructures(kw.SimGeometry)
+    particles = AllocateDataStructures(kw.SimGeometry, kw.SimMetaData)
     logger    = SimulationLogger(save; to_console = false)
     RunSimulation(; kw..., SimLogger = logger, SimParticles = particles)
     order = sortperm(particles.ID)
@@ -53,6 +56,32 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
 
 @testset "SPHExampleGPU" begin
     @test CUDA.functional()
+
+    @testset "mode types mirror the CPU API" begin
+        save = mktempdir()
+        meta = SimulationMetaData{2, Float32}(SimulationName = "m", SaveLocation = save)
+        @test meta isa SimulationMetaData{2, Float32, NoShifting, NoKernelOutput, NoMDBC, NoLog}
+        @test meta.TimeSteppingMode isa SingleNeighborTimeStepping
+        meta = SimulationMetaData{2, Float32, PlanarShifting}(SimulationName = "m", SaveLocation = save)
+        @test meta isa SimulationMetaData{2, Float32, PlanarShifting, NoKernelOutput, NoMDBC, NoLog}
+        meta = SimulationMetaData{3, Float64, NoShifting, StoreKernelOutput, SimpleMDBC, StoreLog}(
+            SimulationName = "m", SaveLocation = save, OutputTimes = 0.01)
+        @test meta isa SimulationMetaData{3, Float64, NoShifting, StoreKernelOutput, SimpleMDBC, StoreLog}
+        @test meta.OutputTimes === 0.01
+        # the shared case file builds against this API: typed meta data plus
+        # the time stepping scheme for `RunSimulation`
+        for c in BENCH_CASES
+            kw = c.build(Float64, save)
+            @test kw.SimTimeStepping isa TimeSteppingMode
+            @test kw.SimMetaData isa SimulationMetaData{c.dims, Float64, S, K, B, StoreLog} where {S, K, B}
+            mdbc = kw.SimMetaData isa SimulationMetaData{c.dims, Float64, S, K, SimpleMDBC, L} where {S, K, L}
+            @test mdbc == (kw.ParticleNormalsPath !== nothing)
+        end
+        kw = BENCH_CASES[1].build(Float64, save)
+        particles = AllocateDataStructures(kw.SimGeometry, kw.SimMetaData)
+        @test length(particles) == length(AllocateDataStructures(kw.SimGeometry))
+        @test hasproperty(particles, :GhostPoints)
+    end
 
     @testset "type-derived factors" begin
         for T in (Float32, Float64)
@@ -247,6 +276,7 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
             @test dv < 1e-7
         end
     else
-        @warn "CPU package not found next to gpu_version; skipping CPU comparison tests"
+        @warn "CPU package with the mode type API not found at $(REPO); skipping CPU comparison tests " *
+              "(set SPHEXAMPLE_CPU_REF to a checkout that has it)"
     end
 end

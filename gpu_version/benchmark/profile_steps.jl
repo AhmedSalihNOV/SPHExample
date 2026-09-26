@@ -12,8 +12,8 @@ include(joinpath(@__DIR__, "cases.jl"))
 function setup(case::BenchCase, ::Type{T}) where {T}
     save = mktempdir()
     kw   = case.build(T, save)
-    particles = AllocateDataStructures(kw.SimGeometry)
-    if kw.SimMetaData.FlagMDBCSimple
+    particles = AllocateDataStructures(kw.SimGeometry, kw.SimMetaData)
+    if kw.ParticleNormalsPath !== nothing   # SimpleMDBC cases
         _, gp, gn = LoadBoundaryNormals(Val(case.dims), T, kw.ParticleNormalsPath)
         for gi in eachindex(gp)
             particles.GhostPoints[gi]  = gp[gi]
@@ -27,6 +27,9 @@ function setup(case::BenchCase, ::Type{T}) where {T}
     red = ReductionWorkspace{SVector{3, T}}(n)
     cl  = CellListWorkspace{case.dims, T}(n)
     mot = MotionArrays(kw.SimGeometry, particles)
+    # `RunSimulation` normally stores the scheme in the meta data; done here
+    # because `SimulationLoop` is driven directly.
+    kw.SimMetaData.TimeSteppingMode = kw.SimTimeStepping
     kw.SimMetaData.OutputIterationCounter = 1
     return kw, gpu, sup, red, cl, mot
 end

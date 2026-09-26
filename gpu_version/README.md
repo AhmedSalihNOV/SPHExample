@@ -93,6 +93,28 @@ Data stays on the GPU for the whole run; the host `StructArray` passed to
 `RunSimulation` holds the state of the last written output (reordered by
 cell, like the CPU version) when the function returns.
 
+### Modes are type parameters
+
+As in the CPU package, the optional features of a run are type parameters of
+`SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode}` rather
+than boolean flags, so the fused kernels are specialised at compile time:
+
+| Parameter | Types | Meaning |
+|-----------|-------|---------|
+| `SMode` | `NoShifting`, `PlanarShifting` | particle shifting |
+| `KMode` | `NoKernelOutput`, `StoreKernelOutput` | store the kernel and kernel gradient sums for output |
+| `BMode` | `NoMDBC`, `SimpleMDBC` | mDBC boundary condition (needs `ParticleNormalsPath`) |
+| `LMode` | `NoLog`, `StoreLog` | write the simulation log file |
+
+Trailing parameters can be omitted, `SimulationMetaData{2, Float32}(...)`
+selects all defaults. `RunSimulation` takes the time stepping scheme as
+`SimTimeStepping`: `SymplecticTimeStepping()` evaluates two neighbour loops per
+step and is the scheme validated against the CPU; `SingleNeighborTimeStepping()`
+reuses the corrector derivative of the previous step as the next predictor and
+evaluates one neighbour loop per step. Because both packages share these types
+and the `AllocateDataStructures(SimGeometry, SimMetaData)` form, the case
+definitions in `benchmark/cases.jl` construct against either package.
+
 ### GPU specific `SimulationMetaData` options
 
 | Option | Default | Meaning |

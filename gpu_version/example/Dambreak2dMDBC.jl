@@ -32,10 +32,8 @@ let
     # Collect the Geometry instances into a vector
     SimulationGeometry = [FixedBoundary; Water]
 
-    # Load in particles
-    SimParticles = AllocateDataStructures(SimulationGeometry)
 
-    SimMetaDataDambreak  = SimulationMetaData{Dimensions,FloatType}(
+    SimMetaDataDambreak  = SimulationMetaData{Dimensions,FloatType,NoShifting,NoKernelOutput,SimpleMDBC,StoreLog}(
         SimulationName="DamBreak2D", 
         SaveLocation="C:/TestSimulations/DamBreak2D_MDBC_GPU/",
         SimulationTime=2,
@@ -43,10 +41,7 @@ let
         VisualizeInParaview=true,
         ExportSingleVTKHDF=true,
         ExportGridCells=true,
-        OpenLogFile=true,
-        FlagOutputKernelValues=false,
-        FlagMDBCSimple=true,
-        FlagLog=true
+        OpenLogFile=true
     )
 
     # If save directory is not already made, make it
@@ -74,6 +69,9 @@ let
     #     return 0*Π, -Π*0
     # end
 
+    # Load in particles
+    SimParticles = AllocateDataStructures(SimulationGeometry, SimMetaDataDambreak)
+
     SimLogger = SimulationLogger(SimMetaDataDambreak.SaveLocation; to_console=true)
 
     CleanUpSimulationFolder(SimMetaDataDambreak.SaveLocation)
@@ -87,6 +85,7 @@ let
         SimParticles         = SimParticles,
         SimViscosity         = ArtificialViscosity(),
         SimDensityDiffusion  = LinearDensityDiffusion(),
+        SimTimeStepping      = SymplecticTimeStepping(),
         ParticleNormalsPath  = "./input/dam_break_2d/DamBreak2d_Dp0.02_MDBC_GhostNodes_ThreeLayers.csv"
     )
 end

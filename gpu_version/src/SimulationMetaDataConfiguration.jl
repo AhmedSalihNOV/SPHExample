@@ -3,18 +3,65 @@ module SimulationMetaDataConfiguration
 using TimerOutputs
 using ProgressMeter
 
-export SimulationMetaData
+export SimulationMetaData, UpdateMetaData!, ShiftingMode, NoShifting, PlanarShifting,
+       KernelOutputMode, NoKernelOutput, StoreKernelOutput,
+       MDBCMode, NoMDBC, SimpleMDBC,
+       LogMode, NoLog, StoreLog,
+       TimeSteppingMode, SymplecticTimeStepping, SingleNeighborTimeStepping
+
+# Mode types shared with the CPU package. They select code paths at compile
+# time (as type parameters of `SimulationMetaData`) instead of run time flags,
+# so that one case definition constructs against both packages.
+abstract type ShiftingMode end
+struct NoShifting     <: ShiftingMode end
+struct PlanarShifting <: ShiftingMode end
+
+abstract type KernelOutputMode end
+struct NoKernelOutput    <: KernelOutputMode end
+struct StoreKernelOutput <: KernelOutputMode end
+
+abstract type MDBCMode end
+struct NoMDBC     <: MDBCMode end
+struct SimpleMDBC <: MDBCMode end
+
+abstract type LogMode end
+struct NoLog    <: LogMode end
+struct StoreLog <: LogMode end
+
+abstract type TimeSteppingMode end
+struct SymplecticTimeStepping     <: TimeSteppingMode end
+struct SingleNeighborTimeStepping <: TimeSteppingMode end
 
 """
-    SimulationMetaData{Dimensions, FloatType}(; SimulationName, SaveLocation, kwargs...)
+    SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode}(; SimulationName, SaveLocation, kwargs...)
 
-Run time meta data of a simulation. Same fields and defaults as the CPU
-version plus a few GPU specific options (all prefixed `GPU`). Unlike the CPU
-version the keyword constructor converts `OutputTimes` (a number or a vector
-of numbers) to `FloatType`, so `OutputTimes = 0.01` also works for
+Run time meta data of a simulation. Same type parameters, fields and defaults
+as the CPU version plus a few GPU specific options (all prefixed `GPU`).
+
+The mode parameters select code paths at compile time:
+
+* `SMode <: ShiftingMode`: `NoShifting` (default) or `PlanarShifting`
+* `KMode <: KernelOutputMode`: `NoKernelOutput` (default) or `StoreKernelOutput`
+  (also store the kernel sum and kernel gradient sum of every particle)
+* `BMode <: MDBCMode`: `NoMDBC` (default) or `SimpleMDBC` (requires
+  `ParticleNormalsPath` in `RunSimulation`)
+* `LMode <: LogMode`: `NoLog` (default) or `StoreLog`
+
+Trailing mode parameters may be omitted, `SimulationMetaData{D, T}(...)`
+selects all defaults. The time stepping scheme is not a type parameter; it is
+passed to `RunSimulation` as `SimTimeStepping` and stored in the
+`TimeSteppingMode` field.
+
+Unlike the CPU version the keyword constructor converts `OutputTimes` (a number
+or a vector of numbers) to `FloatType`, so `OutputTimes = 0.01` also works for
 `FloatType = Float32`.
 """
-mutable struct SimulationMetaData{Dimensions, FloatType <: AbstractFloat}
+mutable struct SimulationMetaData{Dimensions,
+                                  FloatType <: AbstractFloat,
+                                  SMode <: ShiftingMode,
+                                  KMode <: KernelOutputMode,
+                                  BMode <: MDBCMode,
+                                  LMode <: LogMode}
     SimulationName::String
     SaveLocation::String
     HourGlass::TimerOutput
@@ -33,12 +80,7 @@ mutable struct SimulationMetaData{Dimensions, FloatType <: AbstractFloat}
     ExportGridCells::Bool
     OutputVariables::Vector{String}
     OpenLogFile::Bool
-    FlagOutputKernelValues::Bool
-    FlagLog::Bool
-    FlagShifting::Bool
-    FlagSingleStepTimeStepping::Bool
-    ChunkMultiplier::Int
-    FlagMDBCSimple::Bool
+    TimeSteppingMode::TimeSteppingMode
     # GPU specific options
     GPUSyncTimers::Bool          # synchronize after every phase so the timer output is meaningful
     GPUDeterministicSort::Bool   # sort particles inside each cell for bitwise reproducible runs
@@ -68,7 +110,7 @@ const DEFAULT_OUTPUT_VARIABLES = [
 _output_times(::Type{T}, x::Real) where {T} = T(x)
 _output_times(::Type{T}, x::AbstractVector) where {T} = Vector{T}(x)
 
-function SimulationMetaData{Dimensions, FloatType}(;
+function SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode}(;
         SimulationName::String,
         SaveLocation::String,
         HourGlass::TimerOutput                  = TimerOutput(),
@@ -87,12 +129,7 @@ function SimulationMetaData{Dimensions, FloatType}(;
         ExportGridCells::Bool                   = false,
         OutputVariables::Vector{String}         = copy(DEFAULT_OUTPUT_VARIABLES),
         OpenLogFile::Bool                       = true,
-        FlagOutputKernelValues::Bool            = false,
-        FlagLog::Bool                           = false,
-        FlagShifting::Bool                      = false,
-        FlagSingleStepTimeStepping::Bool        = false,
-        ChunkMultiplier::Int                    = 1,
-        FlagMDBCSimple::Bool                    = false,
+        TimeSteppingMode::TimeSteppingMode      = SingleNeighborTimeStepping(),
         GPUSyncTimers::Bool                     = false,
         GPUDeterministicSort::Bool              = true,
         GPUMaxCells::Int                        = 50_000_000,
@@ -100,19 +137,29 @@ function SimulationMetaData{Dimensions, FloatType}(;
         GPULanesPerParticle::Int                = 0,
         GPUBoundaryForces::Bool                 = true,
         GPUAsyncOutput::Bool                    = true,
-    ) where {Dimensions, FloatType <: AbstractFloat}
-    return SimulationMetaData{Dimensions, FloatType}(
+    ) where {Dimensions, FloatType <: AbstractFloat, SMode <: ShiftingMode, KMode <: KernelOutputMode,
+             BMode <: MDBCMode, LMode <: LogMode}
+    return SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode}(
         SimulationName, SaveLocation, HourGlass, Iteration,
         FloatType(OutputEach), _output_times(FloatType, OutputTimes),
         OutputIterationCounter, StepsTakenForLastOutput,
         FloatType(CurrentTimeStep), FloatType(TotalTime), FloatType(SimulationTime),
         IndexCounter, ProgressSpecification, VisualizeInParaview, ExportSingleVTKHDF, ExportGridCells,
-        OutputVariables, OpenLogFile, FlagOutputKernelValues, FlagLog, FlagShifting,
-        FlagSingleStepTimeStepping, ChunkMultiplier, FlagMDBCSimple,
+        OutputVariables, OpenLogFile, TimeSteppingMode,
         GPUSyncTimers, GPUDeterministicSort, GPUMaxCells, GPUInteractionThreads, GPULanesPerParticle,
         GPUBoundaryForces, GPUAsyncOutput,
     )
 end
+
+# Trailing mode parameters default like in the CPU package.
+SimulationMetaData{D,T,S,K,B}(; kwargs...) where {D,T,S<:ShiftingMode,K<:KernelOutputMode,B<:MDBCMode} =
+    SimulationMetaData{D,T,S,K,B,NoLog}(; kwargs...)
+SimulationMetaData{D,T,S,K}(; kwargs...) where {D,T,S<:ShiftingMode,K<:KernelOutputMode} =
+    SimulationMetaData{D,T,S,K,NoMDBC,NoLog}(; kwargs...)
+SimulationMetaData{D,T,S}(; kwargs...) where {D,T,S<:ShiftingMode} =
+    SimulationMetaData{D,T,S,NoKernelOutput,NoMDBC,NoLog}(; kwargs...)
+SimulationMetaData{D,T}(; kwargs...) where {D,T} =
+    SimulationMetaData{D,T,NoShifting,NoKernelOutput,NoMDBC,NoLog}(; kwargs...)
 
 # Allow `meta.OutputTimes = 0.01` for Float32 meta data as well.
 function Base.setproperty!(m::SimulationMetaData{D, T}, name::Symbol, x) where {D, T}
@@ -121,6 +168,13 @@ function Base.setproperty!(m::SimulationMetaData{D, T}, name::Symbol, x) where {
     else
         return setfield!(m, name, convert(fieldtype(typeof(m), name), x))
     end
+end
+
+function UpdateMetaData!(SimMetaData, dt)
+    SimMetaData.Iteration      += 1
+    SimMetaData.CurrentTimeStep = dt
+    SimMetaData.TotalTime      += dt
+    return nothing
 end
 
 end

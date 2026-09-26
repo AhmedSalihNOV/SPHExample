@@ -23,11 +23,11 @@ function run_case(case::BenchCase, ::Type{T}; lanes, threads, bforces = true, wa
     kw.SimMetaData.GPULanesPerParticle   = lanes
     kw.SimMetaData.GPUInteractionThreads = threads
     kw.SimMetaData.GPUBoundaryForces     = bforces
-    particles = AllocateDataStructures(kw.SimGeometry)
+    particles = AllocateDataStructures(kw.SimGeometry, kw.SimMetaData)
     logger    = SimulationLogger(save; to_console = false)
     RunSimulation(; kw..., SimLogger = logger, SimParticles = particles)
     hg    = kw.SimMetaData.HourGlass
-    loop  = TimerOutputs.time(hg["00 SimulationLoop"]) / 1e9
+    loop  = loop_time(hg)
     iters = kw.SimMetaData.Iteration
     return (n = length(particles), iters = iters, loop = loop)
 end

@@ -7,17 +7,40 @@
 #
 # The file is included by `benchmark_cpu.jl` and `benchmark_gpu.jl`, which
 # bring `SPHExample` or `SPHExampleGPU` into scope beforehand. Both packages
-# export the same names, so the definitions below work for either.
+# export the same names, so the definitions below work for either: the
+# shifting, kernel output, mDBC and log modes are the type parameters of
+# `SimulationMetaData`, and the time stepping scheme is passed to
+# `RunSimulation` as `SimTimeStepping`.
 
 using StaticArrays
+using TimerOutputs
 
 const REPO_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 inputpath(args...) = joinpath(REPO_ROOT, "input", args...)
 
+# Scheme used by every case. The symplectic scheme (two neighbour loops per
+# step) is the one the GPU kernels are validated against.
+const BENCH_TIME_STEPPING = SymplecticTimeStepping()
+
+"""
+    loop_time(hg)
+
+Seconds spent in the time stepping loop. The CPU package times every step
+under "00 Simulation Step", the GPU package every output interval under
+"00 SimulationLoop".
+"""
+function loop_time(hg::TimerOutput)
+    for key in ("00 SimulationLoop", "00 Simulation Step")
+        haskey(hg.inner_timers, key) && return TimerOutputs.time(hg[key]) / 1e9
+    end
+    error("no time stepping loop timer found; top level timers: $(collect(keys(hg.inner_timers)))")
+end
+
 """
 A benchmark case: a name, the dimensionality and a constructor
 `(FloatType, SaveLocation) -> NamedTuple` returning the keyword arguments
-that `RunSimulation` needs (except the logger and the particles).
+that `RunSimulation` needs (except the logger and the particles). Allocate
+the particles with `AllocateDataStructures(kw.SimGeometry, kw.SimMetaData)`.
 """
 struct BenchCase
     name::String
@@ -34,12 +57,13 @@ function still_wedge_mdbc(::Type{T}, save; dx = 0.02) where {T}
         Geometry{D,T}(CSVFile=inputpath("still_wedge_mdbc", "StillWedge_Dp$(dx)_Fluid.csv"),
                       GroupMarker=2, Type=Fluid),
     ]
-    meta = SimulationMetaData{D,T}(SimulationName="StillWedgeMDBC", SaveLocation=save,
+    meta = SimulationMetaData{D,T,NoShifting,NoKernelOutput,SimpleMDBC,StoreLog}(SimulationName="StillWedgeMDBC", SaveLocation=save,
         SimulationTime=0.2, OutputTimes=0.05, VisualizeInParaview=false, OpenLogFile=false,
-        ExportSingleVTKHDF=true, ExportGridCells=false, FlagLog=true, FlagMDBCSimple=true)
+        ExportSingleVTKHDF=true, ExportGridCells=false)
     return (SimGeometry=geom, SimMetaData=meta, SimConstants=consts,
             SimKernel=SPHKernelInstance{D,T}(WendlandC2(); dx=consts.dx),
             SimViscosity=ArtificialViscosity(), SimDensityDiffusion=LinearDensityDiffusion(),
+            SimTimeStepping=BENCH_TIME_STEPPING,
             ParticleNormalsPath=inputpath("still_wedge_mdbc", "StillWedge_Dp$(dx)_GhostNodes_Correct.csv"))
 end
 
@@ -52,12 +76,13 @@ function still_wedge_dbc(::Type{T}, save; dx = 0.01) where {T}
         Geometry{D,T}(CSVFile=inputpath("still_wedge", "StillWedge_Dp$(dx)_Fluid.csv"),
                       GroupMarker=2, Type=Fluid),
     ]
-    meta = SimulationMetaData{D,T}(SimulationName="StillWedgeDBC", SaveLocation=save,
+    meta = SimulationMetaData{D,T,NoShifting,NoKernelOutput,NoMDBC,StoreLog}(SimulationName="StillWedgeDBC", SaveLocation=save,
         SimulationTime=0.05, OutputTimes=0.025, VisualizeInParaview=false, OpenLogFile=false,
-        ExportSingleVTKHDF=true, ExportGridCells=false, FlagLog=true)
+        ExportSingleVTKHDF=true, ExportGridCells=false)
     return (SimGeometry=geom, SimMetaData=meta, SimConstants=consts,
             SimKernel=SPHKernelInstance{D,T}(WendlandC2(); dx=consts.dx),
             SimViscosity=ArtificialViscosity(), SimDensityDiffusion=LinearDensityDiffusion(),
+            SimTimeStepping=BENCH_TIME_STEPPING,
             ParticleNormalsPath=nothing)
 end
 
@@ -70,12 +95,13 @@ function dambreak_2d_mdbc(::Type{T}, save) where {T}
         Geometry{D,T}(CSVFile=inputpath("dam_break_2d", "DamBreak2d_Dp0.02_MDBC_Fluid_ThreeLayers.csv"),
                       GroupMarker=2, Type=Fluid),
     ]
-    meta = SimulationMetaData{D,T}(SimulationName="DamBreak2DMDBC", SaveLocation=save,
+    meta = SimulationMetaData{D,T,NoShifting,NoKernelOutput,SimpleMDBC,StoreLog}(SimulationName="DamBreak2DMDBC", SaveLocation=save,
         SimulationTime=0.05, OutputTimes=0.025, VisualizeInParaview=false, OpenLogFile=false,
-        ExportSingleVTKHDF=true, ExportGridCells=false, FlagLog=true, FlagMDBCSimple=true)
+        ExportSingleVTKHDF=true, ExportGridCells=false)
     return (SimGeometry=geom, SimMetaData=meta, SimConstants=consts,
             SimKernel=SPHKernelInstance{D,T}(WendlandC2(); dx=consts.dx),
             SimViscosity=ArtificialViscosity(), SimDensityDiffusion=LinearDensityDiffusion(),
+            SimTimeStepping=BENCH_TIME_STEPPING,
             ParticleNormalsPath=inputpath("dam_break_2d", "DamBreak2d_Dp0.02_MDBC_GhostNodes_ThreeLayers.csv"))
 end
 
@@ -92,12 +118,13 @@ function moving_square_2d(::Type{T}, save; dx = 0.04) where {T}
                       Motion=MotionDetails{D,T}(Velocity=2.8, StartTime=0.0, Duration=3.0,
                                                  Direction=SVector{D,T}(1.0, 0.0))),
     ]
-    meta = SimulationMetaData{D,T}(SimulationName="MovingSquare2D", SaveLocation=save,
+    meta = SimulationMetaData{D,T,PlanarShifting,NoKernelOutput,NoMDBC,StoreLog}(SimulationName="MovingSquare2D", SaveLocation=save,
         SimulationTime=0.05, OutputTimes=0.025, VisualizeInParaview=false, OpenLogFile=false,
-        ExportSingleVTKHDF=true, ExportGridCells=false, FlagLog=true, FlagShifting=true)
+        ExportSingleVTKHDF=true, ExportGridCells=false)
     return (SimGeometry=geom, SimMetaData=meta, SimConstants=consts,
             SimKernel=SPHKernelInstance{D,T}(WendlandC2(); dx=consts.dx, k=T(sqrt(2))),
             SimViscosity=LaminarSPS(), SimDensityDiffusion=ZeroGravityLinearDensityDiffusion(),
+            SimTimeStepping=BENCH_TIME_STEPPING,
             ParticleNormalsPath=nothing)
 end
 
@@ -110,12 +137,13 @@ function dambreak_3d(::Type{T}, save; dx = 0.02) where {T}
         Geometry{D,T}(CSVFile=inputpath("dam_break_3d", "DamBreak3d_Dp$(dx)_Fluid.csv"),
                       GroupMarker=2, Type=Fluid),
     ]
-    meta = SimulationMetaData{D,T}(SimulationName="DamBreak3D", SaveLocation=save,
+    meta = SimulationMetaData{D,T,NoShifting,NoKernelOutput,NoMDBC,StoreLog}(SimulationName="DamBreak3D", SaveLocation=save,
         SimulationTime=0.02, OutputTimes=0.01, VisualizeInParaview=false, OpenLogFile=false,
-        ExportSingleVTKHDF=true, ExportGridCells=false, FlagLog=true)
+        ExportSingleVTKHDF=true, ExportGridCells=false)
     return (SimGeometry=geom, SimMetaData=meta, SimConstants=consts,
             SimKernel=SPHKernelInstance{D,T}(WendlandC2(); h=T(sqrt(3*dx^2))),
             SimViscosity=ArtificialViscosity(), SimDensityDiffusion=LinearDensityDiffusion(),
+            SimTimeStepping=BENCH_TIME_STEPPING,
             ParticleNormalsPath=nothing)
 end
 
@@ -129,12 +157,13 @@ function duckling_3d_mdbc(::Type{T}, save; dx = 0.01) where {T}
         Geometry{D,T}(CSVFile=inputpath("case_duckling_mdbc", "CaseDuckling_Dp$(dx)_Fluid_MDBC.csv"),
                       GroupMarker=2, Type=Fluid),
     ]
-    meta = SimulationMetaData{D,T}(SimulationName="Duckling3DMDBC", SaveLocation=save,
+    meta = SimulationMetaData{D,T,NoShifting,NoKernelOutput,SimpleMDBC,StoreLog}(SimulationName="Duckling3DMDBC", SaveLocation=save,
         SimulationTime=0.03, OutputTimes=0.015, VisualizeInParaview=false, OpenLogFile=false,
-        ExportSingleVTKHDF=true, ExportGridCells=false, FlagLog=true, FlagMDBCSimple=true)
+        ExportSingleVTKHDF=true, ExportGridCells=false)
     return (SimGeometry=geom, SimMetaData=meta, SimConstants=consts,
             SimKernel=SPHKernelInstance{D,T}(WendlandC2(); dx=consts.dx, k=T(1.5)),
             SimViscosity=ArtificialViscosity(), SimDensityDiffusion=LinearDensityDiffusion(),
+            SimTimeStepping=BENCH_TIME_STEPPING,
             ParticleNormalsPath=inputpath("case_duckling_mdbc", "CaseDuckling_Dp$(dx)_GhostNodes.csv"))
 end
 

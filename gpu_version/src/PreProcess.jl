@@ -7,6 +7,7 @@ using StaticArrays
 using StructArrays
 
 using ..SimulationGeometry
+using ..SimulationMetaDataConfiguration: SimulationMetaData
 
 function LoadSpecificCSV(::Val{D}, ::Type{T}, particle_type::ParticleType,
                          particle_group_marker::Int,
@@ -43,6 +44,14 @@ function LoadSpecificCSV(::Val{D}, ::Type{T}, particle_type::ParticleType,
 
     return points, density, types, group_marker, idp
 end
+
+# The device particle container always carries the ghost node and kernel
+# output fields, so the mode types of the meta data do not change the host
+# allocation. The two argument form exists for API parity with the CPU package,
+# which derives the optional fields from the meta data type.
+AllocateDataStructures(SimGeometry::Vector{<:Geometry{Dimensions, FloatType}},
+                       ::SimulationMetaData{Dimensions, FloatType}) where {Dimensions, FloatType} =
+    AllocateDataStructures(SimGeometry)
 
 function AllocateDataStructures(SimGeometry::Vector{<:Geometry{Dimensions, FloatType}}) where {Dimensions, FloatType}
     Position    = Vector{SVector{Dimensions, FloatType}}()

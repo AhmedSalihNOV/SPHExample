@@ -23,11 +23,11 @@ function run_case(case::BenchCase, ::Type{T}; sync = false, warmup = false) wher
         kw.SimMetaData.OutputTimes    = T(1e-7)
     end
     kw.SimMetaData.GPUSyncTimers = sync
-    particles = AllocateDataStructures(kw.SimGeometry)
+    particles = AllocateDataStructures(kw.SimGeometry, kw.SimMetaData)
     logger    = SimulationLogger(save; to_console = false)
     RunSimulation(; kw..., SimLogger = logger, SimParticles = particles)
     hg    = kw.SimMetaData.HourGlass
-    loop  = TimerOutputs.time(hg["00 SimulationLoop"]) / 1e9
+    loop  = loop_time(hg)
     total = TimerOutputs.tottime(hg) / 1e9
     iters = kw.SimMetaData.Iteration
     return (n = length(particles), iters = iters, loop = loop, total = total, hg = hg)

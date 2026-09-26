@@ -293,6 +293,43 @@ macro phase(hg, name, timed, ex)
 end
 
 """
+    enqueue_state_derivative!(ctx, step, timed, mdbc_name, loop_name)
+
+Enqueue the evaluation of the start-of-step state: the mDBC correction of
+the boundary densities together with the pressure of the corrected density
+(`launch_mdbc!`, with `SimpleMDBC`), the reciprocal densities and the
+neighbour loop that produces `dρdtI` and the acceleration. The symplectic
+scheme runs this at every step as its first neighbour loop. The single
+neighbour scheme carries the corrector derivative of the previous step into
+the predictor instead and only runs this to start that derivative: before
+the first step and after a cell list rebuild (`SimulationLoop`). `step`
+gates every kernel; `mdbc_name` and `loop_name` are the timer labels.
+"""
+function enqueue_state_derivative!(ctx, step, timed::Bool, mdbc_name::AbstractString, loop_name::AbstractString)
+    (; gpu, cl, sup, SimKernel, SimConstants, SimDensityDiffusion, SimViscosity,
+       FlagKernel, FlagShift, UseMDBC, threads, lanes, bforces, HourGlass) = ctx
+    grid      = cl.grid_dev
+    CellStart = cl.CellStart
+
+    if UseMDBC
+        @phase HourGlass mdbc_name timed launch_mdbc!(
+            gpu.Density, gpu.Pressure, gpu.Position, gpu.GhostPoints, gpu.Type, CellStart, grid, step,
+            SimKernel, SimConstants; threads = threads, lanes = lanes)
+    end
+
+    @phase HourGlass loop_name timed begin
+        launch_inv_density!(sup.InvDensity, gpu.Density, step)
+        launch_interactions!(sup.dρdtI, gpu.Acceleration, gpu.Kernel, gpu.KernelGradient, sup.∇Cᵢ, sup.∇◌rᵢ,
+                             gpu.Position, gpu.Density, sup.InvDensity, gpu.Pressure,
+                             gpu.Velocity, gpu.Type, CellStart, gpu.CellID, grid, step,
+                             SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
+                             FlagKernel, FlagShift; threads = threads, lanes = lanes,
+                             boundary_forces = bforces)
+    end
+    return nothing
+end
+
+"""
     enqueue_step!(ctx, timed)
 
 Enqueue every kernel of one time step. Nothing in here reads the device:
@@ -301,6 +338,14 @@ grid from `ctx.cl.grid_dev`, and every kernel exits at once when the device
 side stop flag is set. The sequence is therefore identical from step to step
 and can be captured as a CUDA graph (`launch_step_graph!`). With `timed`
 every phase is followed by a synchronization and timed separately.
+
+The step follows the CPU `SimulationLoop` of the selected scheme. Symplectic:
+motion, mDBC, first neighbour loop, half step, second neighbour loop, final
+step. Single neighbour: motion, mDBC correction of the densities the
+predictor starts from, half step, neighbour loop, final step. (The CPU
+additionally re-evaluates the carried derivative every 20 steps; the GPU
+does not, the carried derivative is only re-evaluated after a cell list
+rebuild, see `SimulationLoop`.)
 """
 function enqueue_step!(ctx, timed::Bool)
     (; gpu, cl, sup, red, motion, state, SimKernel, SimConstants, SimDensityDiffusion, SimViscosity,
@@ -319,22 +364,17 @@ function enqueue_step!(ctx, timed::Bool)
                                                        motion, state)
     end
 
-    if !SingleNeighbor
+    if SingleNeighbor
+        # CPU "02 Apply MDBC before Half TimeStep": the boundary densities the
+        # predictor and the final density update start from are corrected
+        # every step, the carried derivative is kept.
         if UseMDBC
-            @phase HourGlass "04a First NeighborLoopMDBC" timed launch_mdbc!(
-                gpu.Density, gpu.Position, gpu.GhostPoints, gpu.Type, CellStart, grid, state,
+            @phase HourGlass "04a NeighborLoopMDBC before Half TimeStep" timed launch_mdbc!(
+                gpu.Density, gpu.Pressure, gpu.Position, gpu.GhostPoints, gpu.Type, CellStart, grid, state,
                 SimKernel, SimConstants; threads = threads, lanes = lanes)
         end
-
-        @phase HourGlass "04 First NeighborLoop" timed begin
-            launch_inv_density!(sup.InvDensity, gpu.Density, state)
-            launch_interactions!(sup.dρdtI, gpu.Acceleration, gpu.Kernel, gpu.KernelGradient, sup.∇Cᵢ, sup.∇◌rᵢ,
-                                 gpu.Position, gpu.Density, sup.InvDensity, gpu.Pressure,
-                                 gpu.Velocity, gpu.Type, CellStart, gpu.CellID, grid, state,
-                                 SimDensityDiffusion, SimViscosity, SimKernel, SimConstants,
-                                 FlagKernel, FlagShift; threads = threads, lanes = lanes,
-                                 boundary_forces = bforces)
-        end
+    else
+        enqueue_state_derivative!(ctx, state, timed, "04a First NeighborLoopMDBC", "04 First NeighborLoop")
     end
 
     @phase HourGlass "05b Update To Half TimeStep" timed launch_half_step!(
@@ -505,6 +545,17 @@ function SimulationLoop(SimDensityDiffusion::SDD, SimViscosity::SV, SimKernel,
                     generation = cl.generation
                 end
                 resume_after_rebuild!(state)
+
+                # The single neighbour scheme carries `dρdtI` and the
+                # acceleration from the previous step, but the rebuild has
+                # reordered the particles (and `dρdtI` is not permuted with
+                # them): re-evaluate both at the accepted full state, as the
+                # CPU does ("03a Rebuild MDBC" .. "03c Rebuild NeighborLoop").
+                # Before the first step this is the CPU "00 Init" evaluation,
+                # because the initial displacement bound forces a rebuild.
+                if SingleNeighbor
+                    enqueue_state_derivative!(ctx, state, timed, "02b Rebuild MDBC", "02c Rebuild NeighborLoop")
+                end
             end
         elseif stop == STOP_OUTPUT || SimMetaData.TotalTime > t_out
             break
@@ -589,7 +640,8 @@ function RunSimulation(;SimGeometry::Vector{Geometry{Dimensions, FloatType}},
         sup    = GPUSupportArrays{Dimensions, FloatType}(NumberOfPoints)
         red    = ReductionWorkspace{SVector{3, FloatType}}(NumberOfPoints)
         cl     = CellListWorkspace{Dimensions, FloatType}(NumberOfPoints;
-                     max_cells = SimMetaData.GPUMaxCells, deterministic = SimMetaData.GPUDeterministicSort)
+                     reach = SimMetaData.GPUCellSubdivision, max_cells = SimMetaData.GPUMaxCells,
+                     deterministic = SimMetaData.GPUDeterministicSort)
         motion = MotionArrays(SimGeometry, SimParticles)
         # Device resident loop state. The displacement bound starts above `h`
         # so that the cell list is built before the first step.

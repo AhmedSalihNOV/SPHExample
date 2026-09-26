@@ -22,9 +22,12 @@ const HAVE_CPU  = isfile(joinpath(REPO, "src", "SPHExample.jl")) && isfile(CPU_M
 Run `case` on the GPU for `simtime` seconds of physical time and return the
 particles sorted by ID together with the meta data.
 """
-function run_gpu(case::BenchCase, ::Type{T}, simtime; kwargs...) where {T}
+function run_gpu(case::BenchCase, ::Type{T}, simtime; time_stepping = nothing, kwargs...) where {T}
     save = mktempdir()
     kw   = case.build(T, save)
+    if time_stepping !== nothing
+        kw = merge(kw, (; SimTimeStepping = time_stepping))
+    end
     kw.SimMetaData.SimulationTime = T(simtime)
     kw.SimMetaData.OutputTimes    = T(simtime)
     for (k, v) in kwargs
@@ -41,9 +44,10 @@ end
 Run the CPU reference in a separate Julia process (separate environment) and
 return the stored state.
 """
-function run_cpu_reference(case::BenchCase, simtime)
+function run_cpu_reference(case::BenchCase, simtime; time_stepping = nothing)
     out = tempname() * ".h5"
-    cmd = `$(Base.julia_cmd()) -t 8,0 --project=$(REPO) $(CPU_REF) $(case.name) $(simtime) $(out)`
+    scheme = time_stepping === nothing ? String[] : [string(nameof(typeof(time_stepping)))]
+    cmd = `$(Base.julia_cmd()) -t 8,0 --project=$(REPO) $(CPU_REF) $(case.name) $(simtime) $(out) $(scheme)`
     run(pipeline(cmd; stdout = devnull, stderr = devnull))
     return h5open(out, "r") do fid
         (ID = read(fid["ID"]), Density = read(fid["Density"]), Pressure = read(fid["Pressure"]),
@@ -175,10 +179,67 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
         @test map_floor(-0.021, invH) == -1
         @test map_floor(-0.019, invH) == 0
         grid = CellGrid{2}((Int32(-3), Int32(-2)), (Int32(10), Int32(8)), Int32(80))
+        @test grid isa CellGrid{2, 1}
         for c in ((-2, -1), (0, 0), (5, 4))
             lin = SPHExampleGPU.GPUCellGrid.linear_cell(grid, Int32.(c))
             l   = SPHExampleGPU.GPUCellGrid.local_coords(grid, lin)
             @test l .+ grid.origin == Int32.(c)
+        end
+        g1 = CellGrid{3}((Int32(0), Int32(0), Int32(0)), (Int32(10), Int32(8), Int32(6)), Int32(480))
+        @test SPHExampleGPU.GPUCellGrid.row_offsets(g1) == (-90, -80, -70, -10, 0, 10, 70, 80, 90)
+        CellStart = Int32.(0:10:1000)
+        @test SPHExampleGPU.GPUCellGrid.row_range(g1, CellStart, Int32(50), Int32(0)) == (CellStart[49] + 1, CellStart[52])
+    end
+
+    @testset "cell grid helpers, half width cells (reach 2)" begin
+        G = SPHExampleGPU.GPUCellGrid
+        grid = CellGrid{2, 2}((Int32(-3), Int32(-2)), (Int32(10), Int32(8)), Int32(80))
+        @test G.reach(grid) == 2
+        @test G.bin_scale(grid, 0.5f0) === 1.0f0
+        for c in ((-1, 0), (0, 0), (4, 3))
+            lin = G.linear_cell(grid, Int32.(c))
+            @test G.local_coords(grid, lin) .+ grid.origin == Int32.(c)
+        end
+        # clamped into the margin: never closer than R cells to the edge
+        @test G.local_coords(grid, G.linear_cell(grid, (Int32(-3), Int32(-2)))) == (2, 2)
+        @test G.local_coords(grid, G.linear_cell(grid, (Int32(100), Int32(100)))) == (7, 5)
+        @test collect(G.row_offsets(grid)) == [-20, -10, 0, 10, 20]
+        g3 = CellGrid{3, 2}((Int32(0), Int32(0), Int32(0)), (Int32(10), Int32(8), Int32(6)), Int32(480))
+        offs = collect(G.row_offsets(g3))
+        @test length(offs) == 25
+        @test offs[13] == 0 && offs[1] == -2 * 80 - 2 * 10 && offs[25] == 2 * 80 + 2 * 10
+        CellStart = Int32.(0:10:1000)
+        @test G.row_range(g3, CellStart, Int32(50), Int32(0)) == (CellStart[48] + 1, CellStart[53])
+        @test_throws ArgumentError SimulationMetaData{2, Float32}(SimulationName = "x", SaveLocation = mktempdir(),
+                                                                  GPUCellSubdivision = 0)
+    end
+
+    @testset "half width cells find the same pairs" begin
+        # With the density diffusion off every pair term is antisymmetric, so
+        # the H and H/2 grids must agree to rounding (same pairs, different
+        # summation order). With it on, only the orientation of the asymmetric
+        # term differs (`GPUCellSubdivision = 1` follows the CPU's choice).
+        with_constants(c::SimulationConstants{T}; kwargs...) where {T} = begin
+            names = fieldnames(typeof(c))
+            nt = NamedTuple{names}(ntuple(i -> getfield(c, i), length(names)))
+            SimulationConstants{T}(; merge(nt, values(kwargs))...)
+        end
+        for (name, simtime) in (("StillWedge2D_MDBC_dp0.02", 0.004), ("DamBreak3D_dp0.02", 0.002))
+            case = BENCH_CASES[findfirst(c -> c.name == name, BENCH_CASES)]
+            nodiff = BenchCase(case.name, case.dims, (T, s) -> begin
+                kw = case.build(T, s)
+                merge(kw, (; SimConstants = with_constants(kw.SimConstants; δᵩ = zero(T))))
+            end)
+            p1, m1 = run_gpu(nodiff, Float64, simtime; GPUCellSubdivision = 1)
+            p2, m2 = run_gpu(nodiff, Float64, simtime; GPUCellSubdivision = 2)
+            @test m1.Iteration == m2.Iteration > 1
+            @test p1.ID == p2.ID
+            @test relerr(p2.Density, p1.Density) < 1e-9
+            @test maximum(norm.(p2.Position .- p1.Position)) < 1e-12
+            @test maximum(norm.(p2.Velocity .- p1.Velocity)) < 1e-9
+            q1, _ = run_gpu(case, Float64, simtime; GPUCellSubdivision = 1)
+            q2, _ = run_gpu(case, Float64, simtime; GPUCellSubdivision = 2)
+            @test relerr(q2.Density, q1.Density) < 1e-3
         end
     end
 
@@ -255,6 +316,7 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
             Velocityₙ⁺   = [rnd() for _ in 1:n]
             Positionₙ⁺   = Position .+ [1e-3 * rnd() for _ in 1:n]
             Density  = 1000 .+ 50 .* rand(T, n)
+            Density[1:3:end] .-= 60     # below ρ₀, as the mDBC correction may leave a boundary density
             ρₙ⁺      = 1000 .+ 50 .* rand(T, n)
             dρdtI    = randn(T, n)
             ∇Cᵢ      = [rnd() for _ in 1:n]
@@ -271,11 +333,19 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
                                HostStep(dt, zero(T)), kern, consts, red, Val(FlagShift))
             xg = Array(dP)
             vg = Array(dV)
+            ρg = Array(dρ)
+            Pg = Array(dPr)
 
             x_ref = similar(Position); v_ref = similar(Velocity); x_avg = similar(Position)
+            ρ_ref = similar(Density); ρ_upd = similar(Density)
             for i in 1:n
                 ML  = MotionLimiterValue(T, types[i])
                 GF  = GravityFactorValue(T, types[i])
+                # DensityEpsi! then LimitDensityAtBoundary! (the CPU order)
+                epsi = -(dρdtI[i] / ρₙ⁺[i]) * dt
+                ρ    = Density[i] * (2 - epsi) / (2 + epsi)
+                ρ_upd[i] = ρ
+                ρ_ref[i] = (types[i] != Fluid && ρ < consts.ρ₀) ? consts.ρ₀ : ρ
                 acc = Acceleration[i] + ConstructGravitySVector(Acceleration[i], consts.g * GF)
                 v   = Velocity[i] + acc * dt * ML
                 δx  = zero(V)
@@ -289,6 +359,15 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
             end
             @test all(isapprox.(vg, v_ref; rtol = 1e-13, atol = 1e-15))
             @test all(isapprox.(xg, x_ref; rtol = 1e-13, atol = 1e-15))
+            @test all(isapprox.(ρg, ρ_ref; rtol = 1e-13))
+            @test all(isapprox.(Pg, EquationOfStateGamma7.(ρg, consts.c₀, consts.ρ₀); rtol = 1e-12, atol = 1e-8))
+            # limiting after the update: a boundary particle whose updated
+            # density is below ρ₀ ends exactly at ρ₀ (limiting before the
+            # update would leave it at ρ₀ * (2 - ϵ) / (2 + ϵ) instead)
+            clamped = (types .!= Fluid) .& (ρ_upd .< consts.ρ₀)
+            @test count(clamped) > n ÷ 10
+            @test all(ρg[clamped] .== consts.ρ₀)
+            @test all(ρg[.!clamped] .!= consts.ρ₀)
             # the old averaged scheme differs for every moving particle
             moving = types .== Fluid
             @test maximum(norm.(xg[moving] .- x_avg[moving])) > 1e-6
@@ -385,6 +464,30 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
         @test Array(dP) != P
     end
 
+    @testset "single neighbour scheme with mDBC runs, applies the correction and replays as a graph" begin
+        # The boundary densities of the still wedge only leave ρ₀ through the
+        # mDBC correction (the boundary particles do not move and their
+        # continuity update follows the corrected density), so a run with
+        # `SimpleMDBC` must have corrected boundary densities after the first
+        # steps. Graph replay in batches must reproduce direct launches with
+        # a read back after every step bitwise.
+        case = BENCH_CASES[findfirst(c -> c.name == "StillWedge2D_MDBC_dp0.02", BENCH_CASES)]
+        p1, m1 = run_gpu(case, Float64, 0.02; time_stepping = SingleNeighborTimeStepping())
+        p2, m2 = run_gpu(case, Float64, 0.02; time_stepping = SingleNeighborTimeStepping(),
+                         GPUUseGraph = false, GPUMaxStepsPerSync = 1)
+        @test m1.TimeSteppingMode isa SingleNeighborTimeStepping
+        @test m1.Iteration == m2.Iteration > 1
+        @test m1.TotalTime == m2.TotalTime
+        @test p1.ID == p2.ID
+        @test p1.Position == p2.Position
+        @test p1.Velocity == p2.Velocity
+        @test p1.Density  == p2.Density
+        bound = p1.Type .== Fixed
+        @test any(bound)
+        @test all(isfinite, p1.Density) && all(isfinite, p1.Pressure)
+        @test any(abs.(p1.Density[bound] .- 1000) .> 1e-3)
+    end
+
     @testset "graph replay and batching reproduce direct launches" begin
         # The same steps, once as replayed CUDA graphs in batches and once
         # launched directly with a read back after every step, must give the
@@ -449,15 +552,17 @@ relerr(a, b) = maximum(abs.(a .- b) ./ max.(abs.(b), eps(eltype(b))))
     end
 
     if HAVE_CPU
-        @testset "matches CPU reference: $(name)" for (name, simtime) in (
-                ("StillWedge2D_MDBC_dp0.02", 0.02),
-                ("MovingSquare2D_dp0.04",    0.01),
-                ("DamBreak3D_dp0.02",        0.005),
-                ("Duckling3D_MDBC_dp0.01",   0.005),
+        @testset "matches CPU reference: $(name) ($(nameof(typeof(scheme))))" for (name, simtime, scheme) in (
+                ("StillWedge2D_MDBC_dp0.02", 0.02,  SymplecticTimeStepping()),
+                ("MovingSquare2D_dp0.04",    0.01,  SymplecticTimeStepping()),
+                ("DamBreak3D_dp0.02",        0.005, SymplecticTimeStepping()),
+                ("Duckling3D_MDBC_dp0.01",   0.005, SymplecticTimeStepping()),
+                ("StillWedge2D_MDBC_dp0.02", 0.02,  SingleNeighborTimeStepping()),
+                ("DamBreak3D_dp0.02",        0.005, SingleNeighborTimeStepping()),
             )
             case = BENCH_CASES[findfirst(c -> c.name == name, BENCH_CASES)]
-            ref  = run_cpu_reference(case, simtime)
-            p, meta = run_gpu(case, Float64, simtime)
+            ref  = run_cpu_reference(case, simtime; time_stepping = scheme)
+            p, meta = run_gpu(case, Float64, simtime; time_stepping = scheme)
 
             @test meta.Iteration == ref.Iteration
             @test p.ID == ref.ID

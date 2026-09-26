@@ -48,7 +48,9 @@ let
         VisualizeInParaview    = true,
         ExportSingleVTKHDF     = true,
         ExportGridCells        = true,
-        OpenLogFile            = true
+        OpenLogFile            = true,
+        GPUCellSubdivision     = 2,
+        GPULanesPerParticle    = 1,
     )
 
     if !isdir(SimMetaDataDambreak3D.SaveLocation)

@@ -18,7 +18,10 @@ approximation) and a user supplied model may not be either. To reproduce the
 CPU results exactly the gather kernel reconstructs which particle of a pair
 was the CPU's `i`: for pairs inside one cell the lower index, for pairs in
 different cells the particle in the cell that is processed (the higher index,
-because the CPU stencil only visits cells with a lower linear index).
+because the CPU stencil only visits cells with a lower linear index). Both
+particles of a pair reach the same decision, so the rule stays consistent for
+any grid; it only reproduces the CPU's choice with the CPU's cells of edge
+`H` (`GPUCellSubdivision = 1`).
 
 Every kernel of a time step takes the device resident step state (`step`, see
 `GPUStepState`) and reads the step size and the simulated time from it; the
@@ -200,9 +203,7 @@ function interaction_kernel!(dρdtI, Acceleration, Kernel, KernelGradient, ∇C�
         own_hi = CellStart[c + Int32(1)]
 
         for off in row_offsets(grid)
-            row0 = c + off - Int32(1)
-            jlo  = CellStart[row0] + Int32(1)
-            jhi  = CellStart[row0 + Int32(3)]
+            jlo, jhi = row_range(grid, CellStart, c, off)
             j = jlo + lane
             while j <= jhi
                 if j != i
@@ -372,15 +373,16 @@ end
     return b, A
 end
 
-# Visit the three by three (by three) cells around the ghost node. Ghost
-# nodes may lie outside the particle grid, so every row is range checked.
+# Visit the (2R+1)^D cells around the ghost node (R the reach of the grid).
+# Ghost nodes may lie outside the particle grid, so every row is range checked.
 @inline function mdbc_rows(b, A, gp::SVector{2, T}, lg, grid::CellGrid{2}, CellStart, Position,
                            Density, ParticleType, SimKernel, m₀, lane, lanes::Val) where {T}
     n1, n2 = grid.dims
-    xlo = max(lg[1] - Int32(1), Int32(0))
-    xhi = min(lg[1] + Int32(1), n1 - Int32(1))
+    R   = reach(grid)
+    xlo = max(lg[1] - R, Int32(0))
+    xhi = min(lg[1] + R, n1 - Int32(1))
     @inbounds if xlo <= xhi
-        for dy in Int32(-1):Int32(1)
+        for dy in -R:R
             ly = lg[2] + dy
             if (ly >= Int32(0)) & (ly < n2)
                 row0 = Int32(1) + xlo + n1 * ly
@@ -396,13 +398,14 @@ end
 @inline function mdbc_rows(b, A, gp::SVector{3, T}, lg, grid::CellGrid{3}, CellStart, Position,
                            Density, ParticleType, SimKernel, m₀, lane, lanes::Val) where {T}
     n1, n2, n3 = grid.dims
-    xlo = max(lg[1] - Int32(1), Int32(0))
-    xhi = min(lg[1] + Int32(1), n1 - Int32(1))
+    R   = reach(grid)
+    xlo = max(lg[1] - R, Int32(0))
+    xhi = min(lg[1] + R, n1 - Int32(1))
     @inbounds if xlo <= xhi
-        for dz in Int32(-1):Int32(1)
+        for dz in -R:R
             lz = lg[3] + dz
             if (lz >= Int32(0)) & (lz < n3)
-                for dy in Int32(-1):Int32(1)
+                for dy in -R:R
                     ly = lg[2] + dy
                     if (ly >= Int32(0)) & (ly < n2)
                         row0 = Int32(1) + xlo + n1 * (ly + n2 * lz)
@@ -418,7 +421,7 @@ end
     return b, A
 end
 
-function mdbc_kernel!(Density, Position::AbstractVector{SVector{D, T}}, GhostPoints, ParticleType,
+function mdbc_kernel!(Density, Pressure, Position::AbstractVector{SVector{D, T}}, GhostPoints, ParticleType,
                       CellStart, gridarg, step,
                       SimKernel, SimConstants, ::Val{K}, n::Int32) where {D, T, K}
     step_active(step) || return nothing
@@ -428,7 +431,7 @@ function mdbc_kernel!(Density, Position::AbstractVector{SVector{D, T}}, GhostPoi
     lane = (t - Int32(1)) % Int32(K)
 
     DP = D + 1
-    (; m₀, ρ₀) = SimConstants
+    (; m₀, ρ₀, c₀) = SimConstants
 
     b = zero(SVector{DP, T})
     A = zero(SMatrix{DP, DP, T, DP * DP})
@@ -441,7 +444,7 @@ function mdbc_kernel!(Density, Position::AbstractVector{SVector{D, T}}, GhostPoi
     end
 
     @inbounds if valid
-        cg = cell_coords(gp, SimKernel.H⁻¹)
+        cg = cell_coords(gp, bin_scale(grid, SimKernel.H⁻¹))
         lg = ntuple(d -> cg[d] - grid.origin[d], Val(D))
         b, A = mdbc_rows(b, A, gp, lg, grid, CellStart, Position, Density, ParticleType, SimKernel, m₀,
                          lane, Val(K))
@@ -454,29 +457,43 @@ function mdbc_kernel!(Density, Position::AbstractVector{SVector{D, T}}, GhostPoi
 
     # Density correction (mirrors ApplyMDBCCorrection of the CPU code)
     # https://github.com/DualSPHysics/DualSPHysics/blob/f4fa76ad5083873fa1c6dd3b26cdce89c55a9aeb/src/source/JSphCpu_mdbc.cpp#L347
+    # followed by the pressure of the corrected density (the CPU calls
+    # `Pressure!` after the correction; a neighbour loop that reads the
+    # corrected density must see the matching boundary pressure).
     @inbounds if valid & (lane == Int32(0))
+        ρ = Density[i]
         if abs(det(A)) >= 1e-3
             sol  = A \ b
             diff = Position[i] - gp
             grad = SVector{D, T}(ntuple(k -> sol[k + 1], Val(D)))
             v1   = sol[1] + dot(grad, diff)
-            Density[i] = isnan(v1) ? ρ₀ : v1
+            ρ    = isnan(v1) ? ρ₀ : v1
         elseif A[1, 1] > zero(T)
             v = b[1] / A[1, 1]
-            Density[i] = isnan(v) ? ρ₀ : v
+            ρ = isnan(v) ? ρ₀ : v
         end
+        Density[i]  = ρ
+        Pressure[i] = EquationOfStateGamma7(ρ, c₀, ρ₀)
     end
     return nothing
 end
 
-function launch_mdbc!(Density, Position, GhostPoints, ParticleType, CellStart, grid, step, SimKernel,
+"""
+    launch_mdbc!(Density, Pressure, Position, GhostPoints, ParticleType, CellStart, grid, step,
+                 SimKernel, SimConstants; threads, lanes)
+
+mDBC correction of the density of the boundary particles that own a ghost
+node, and the pressure of the corrected density. `step` gates the kernel
+(see `GPUStepState`).
+"""
+function launch_mdbc!(Density, Pressure, Position, GhostPoints, ParticleType, CellStart, grid, step, SimKernel,
                       SimConstants; threads::Integer = 128, lanes::Val = Val(1))
     n = length(Density)
     n == 0 && return nothing
     K = typeof(lanes).parameters[1]
     @cuda threads=threads blocks=cld(n * K, threads) mdbc_kernel!(
-        Density, Position, GhostPoints, ParticleType, CellStart, grid, step, SimKernel, SimConstants, lanes,
-        Int32(n))
+        Density, Pressure, Position, GhostPoints, ParticleType, CellStart, grid, step, SimKernel, SimConstants,
+        lanes, Int32(n))
     return nothing
 end
 
@@ -528,7 +545,7 @@ function launch_half_step!(Positionₙ⁺, Velocityₙ⁺, ρₙ⁺, InvDensity�
 end
 
 #---------------------------------------------------------------
-# Final step: density limiting, density update, symplectic corrector, the
+# Final step: density update, density limiting, symplectic corrector, the
 # pressure for the next step and the per step reduction (time step limits and
 # displacement) for the next step.
 #
@@ -577,10 +594,12 @@ function final_step_kernel!(Position, Velocity, Acceleration, Density, Pressure,
         type = ParticleType[i]
         ML = MotionLimiterValue(T, type)
 
-        # LimitDensityAtBoundary! followed by DensityEpsi!
-        ρ    = limit_density(Density[i], ρ₀, ML)
+        # DensityEpsi! followed by LimitDensityAtBoundary! (CPU order: "07
+        # Final Density", "08 Final LimitDensityAtBoundary")
+        ρ    = Density[i]
         epsi = -(dρdtI[i] / ρₙ⁺[i]) * dt
         ρ   *= (2 - epsi) / (2 + epsi)
+        ρ    = limit_density(ρ, ρ₀, ML)
         Density[i]  = ρ
         Pressure[i] = EquationOfStateGamma7(ρ, c₀, ρ₀)
 

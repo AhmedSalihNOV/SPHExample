@@ -1,16 +1,22 @@
 """
 GPU cell list (uniform grid neighbour search).
 
-Particles are binned into a dense grid of cubic cells with edge length `H`
-(the kernel support radius). The grid covers the bounding box of all
-particles plus a one cell margin on every side, so that the 3 (2D) or 9 (3D)
-rows of three neighbouring cells around any occupied cell are always valid
-indices. Particles are physically reordered by cell (counting sort) so that
-a particle's neighbours are contiguous in memory.
+Particles are binned into a dense grid of cubic cells with edge length
+`H / R` (`H` the kernel support radius, `R` the *reach* of the grid, a type
+parameter). A particle's neighbours then lie in the `(2R+1)^D` cells around
+its own: `R = 1` is the classic grid of edge `H` with a 3x3(x3) stencil,
+`R = 2` bins at `H/2` with a 5x5(x5) stencil, which scans about 42 % less
+volume in 3D (2.5^3 = 15.6 cells of edge `H` instead of 27) at the price of
+more, shorter cell ranges. The grid covers the bounding box of all particles
+plus an `R` cell margin on every side, so that the rows of neighbouring cells
+around any occupied cell are always valid indices. Particles are physically
+reordered by cell (counting sort) so that a particle's neighbours are
+contiguous in memory.
 
-Cell indices are linear with the first coordinate varying fastest. The three
-cells `(cx-1, cy, cz)`, `(cx, cy, cz)`, `(cx+1, cy, cz)` therefore form one
-contiguous particle range, which the interaction kernels exploit.
+Cell indices are linear with the first coordinate varying fastest. The
+`2R+1` cells `(cx-R .. cx+R, cy, cz)` of one row therefore form one contiguous
+particle range (`row_range`), which the interaction kernels exploit: a 3D
+particle scans `(2R+1)^2` ranges (9 for `R = 1`, 25 for `R = 2`).
 
 `CellStart` stores exclusive prefix sums with a leading zero: particles of
 cell `c` occupy the (1-based) index range `CellStart[c]+1 : CellStart[c+1]`.
@@ -22,8 +28,8 @@ using StaticArrays
 using ..GPUReductions
 
 export CellGrid, CellListWorkspace, update_cell_list!, unique_cells_host,
-       map_floor, cell_coords, linear_cell, local_coords, row_offsets, in_grid,
-       gather_kernel!, thread_index, load_grid
+       map_floor, cell_coords, linear_cell, local_coords, row_offsets, row_range, in_grid,
+       reach, bin_scale, gather_kernel!, thread_index, load_grid
 
 const SORT_THREADS = 256
 
@@ -45,15 +51,35 @@ end
 
 """
 Uniform grid description: `origin` is the global cell coordinate of the first
-grid cell (including the margin) and `dims` the number of cells per axis.
+grid cell (including the margin) and `dims` the number of cells per axis. The
+type parameter `R` is the reach of the neighbour stencil in cells (the cell
+edge is `H / R`, see the module documentation); `CellGrid{D}` is `R = 1`.
 """
-struct CellGrid{D}
+struct CellGrid{D, R}
     origin::NTuple{D, Int32}
     dims::NTuple{D, Int32}
     ncells::Int32
 end
 
-CellGrid{D}() where {D} = CellGrid{D}(ntuple(_ -> Int32(0), Val(D)), ntuple(_ -> Int32(1), Val(D)), Int32(1))
+(::Type{CellGrid{D}})(origin, dims, ncells) where {D} = CellGrid{D, 1}(origin, dims, ncells)
+CellGrid{D, R}() where {D, R} = CellGrid{D, R}(ntuple(_ -> Int32(0), Val(D)), ntuple(_ -> Int32(1), Val(D)), Int32(1))
+CellGrid{D}() where {D} = CellGrid{D, 1}()
+
+"""
+    reach(grid) -> Int32
+
+Number of cells the neighbour stencil extends from a particle's own cell in
+every direction (`R`).
+"""
+@inline reach(::CellGrid{D, R}) where {D, R} = Int32(R)
+
+"""
+    bin_scale(grid, InverseCutOff)
+
+Factor that converts a position into a cell coordinate of `grid`: `R / H`.
+`R` is a small integer, so the scaled value is exact for `R = 1, 2, 4`.
+"""
+@inline bin_scale(::CellGrid{D, R}, InverseCutOff::T) where {D, R, T} = T(R) * InverseCutOff
 
 """
     load_grid(g) -> CellGrid
@@ -81,19 +107,20 @@ end
 
 """
 Linear (1-based) cell index of the global cell coordinates `c`. The result is
-clamped to the interior of the grid (one cell away from the margin) so that a
-corrupt position can never produce an out of bounds neighbour range.
+clamped to the interior of the grid (`R` cells away from the edge, i.e. inside
+the margin) so that a corrupt position can never produce an out of bounds
+neighbour range.
 """
-@inline function linear_cell(grid::CellGrid{2}, c::NTuple{2, Int32})
-    l1 = clamp(c[1] - grid.origin[1], Int32(1), grid.dims[1] - Int32(2))
-    l2 = clamp(c[2] - grid.origin[2], Int32(1), grid.dims[2] - Int32(2))
+@inline function linear_cell(grid::CellGrid{2, R}, c::NTuple{2, Int32}) where {R}
+    l1 = clamp(c[1] - grid.origin[1], Int32(R), grid.dims[1] - Int32(R + 1))
+    l2 = clamp(c[2] - grid.origin[2], Int32(R), grid.dims[2] - Int32(R + 1))
     return Int32(1) + l1 + grid.dims[1] * l2
 end
 
-@inline function linear_cell(grid::CellGrid{3}, c::NTuple{3, Int32})
-    l1 = clamp(c[1] - grid.origin[1], Int32(1), grid.dims[1] - Int32(2))
-    l2 = clamp(c[2] - grid.origin[2], Int32(1), grid.dims[2] - Int32(2))
-    l3 = clamp(c[3] - grid.origin[3], Int32(1), grid.dims[3] - Int32(2))
+@inline function linear_cell(grid::CellGrid{3, R}, c::NTuple{3, Int32}) where {R}
+    l1 = clamp(c[1] - grid.origin[1], Int32(R), grid.dims[1] - Int32(R + 1))
+    l2 = clamp(c[2] - grid.origin[2], Int32(R), grid.dims[2] - Int32(R + 1))
+    l3 = clamp(c[3] - grid.origin[3], Int32(R), grid.dims[3] - Int32(R + 1))
     return Int32(1) + l1 + grid.dims[1] * (l2 + grid.dims[2] * l3)
 end
 
@@ -119,16 +146,53 @@ end
 end
 
 """
-Linear index offsets of the neighbouring rows of an interior cell. Each row
-holds three consecutive cells `(cx-1 .. cx+1)`; the offset points at the
-centre cell of the row.
+Linear index offsets of the neighbouring rows of an interior cell (`2R+1` rows
+in 2D, `(2R+1)^2` in 3D). Each row holds the `2R+1` consecutive cells
+`(cx-R .. cx+R)`; the offset points at the centre cell of the row. For
+`R = 1` a tuple (the kernels' row loops unroll), for `R >= 2` a lazy iterator.
 """
-@inline row_offsets(grid::CellGrid{2}) = (-grid.dims[1], Int32(0), grid.dims[1])
+@inline row_offsets(grid::CellGrid{2, 1}) = (-grid.dims[1], Int32(0), grid.dims[1])
 
-@inline function row_offsets(grid::CellGrid{3})
+@inline function row_offsets(grid::CellGrid{3, 1})
     n1  = grid.dims[1]
     n12 = grid.dims[1] * grid.dims[2]
     return (-n12 - n1, -n12, -n12 + n1, -n1, Int32(0), n1, n12 - n1, n12, n12 + n1)
+end
+
+"""
+Lazy row offsets of a grid with reach `R >= 2`: `(2R+1)^(D-1)` offsets in
+the same order as the tuples above (last coordinate outermost). A tuple
+would unroll the pair loop body 25 times in 3D, which costs instruction
+cache; this iterates with a counter instead.
+"""
+struct RowOffsets{D, R}
+    n1::Int32
+    n12::Int32
+end
+
+Base.length(::RowOffsets{D, R}) where {D, R} = (2R + 1)^(D - 1)
+Base.eltype(::Type{<:RowOffsets}) = Int32
+@inline Base.iterate(r::RowOffsets) = iterate(r, Int32(0))
+@inline function Base.iterate(r::RowOffsets{D, R}, k::Int32) where {D, R}
+    W = Int32(2R + 1)
+    k >= W^(D - 1) && return nothing
+    off = D == 2 ? (k - Int32(R)) * r.n1 : (k ÷ W - Int32(R)) * r.n12 + (k % W - Int32(R)) * r.n1
+    return off, k + Int32(1)
+end
+
+@inline row_offsets(grid::CellGrid{D, R}) where {D, R} = RowOffsets{D, R}(grid.dims[1], grid.dims[1] * grid.dims[2])
+
+"""
+    row_range(grid, CellStart, c, off) -> (jlo, jhi)
+
+The (1-based, inclusive) particle index range of the row of `2R+1` cells
+centred on cell `c + off`, where `off` is one of `row_offsets(grid)`.
+"""
+@inline function row_range(grid::CellGrid{D, R}, CellStart, c::Int32, off::Int32) where {D, R}
+    row0 = c + off - Int32(R)
+    @inbounds jlo = CellStart[row0] + Int32(1)
+    @inbounds jhi = CellStart[row0 + Int32(2R + 1)]
+    return jlo, jhi
 end
 
 """
@@ -137,26 +201,34 @@ bounding box of the particles grows; `generation` counts those
 reallocations so that holders of raw device pointers (captured graphs) can
 notice. `grid_dev` is a one element device copy of `grid` for the kernels.
 """
-mutable struct CellListWorkspace{D, T, R <: ReductionWorkspace}
-    grid::CellGrid{D}
-    grid_dev::CuVector{CellGrid{D}}
+mutable struct CellListWorkspace{D, T, R, W <: ReductionWorkspace}
+    grid::CellGrid{D, R}
+    grid_dev::CuVector{CellGrid{D, R}}
     generation::Int
     CellStart::CuVector{Int32}       # capacity >= ncells + 1
     Counts::CuVector{Int32}          # capacity >= ncells
     Perm::CuVector{Int32}            # length n, new index -> old index
     CellIDScratch::CuVector{Int32}   # length n, cell of particle (old order)
-    bbox_ws::R
+    bbox_ws::W
     max_cells::Int
     deterministic::Bool
     nrebuilds::Int
 end
 
-function CellListWorkspace{D, T}(n::Integer; max_cells::Integer = 50_000_000,
+"""
+    CellListWorkspace{D, T}(n; reach = 1, max_cells, deterministic)
+
+Cell list buffers for `n` particles. `reach` selects the grid: cells of edge
+`H / reach` and a `(2 reach + 1)^D` stencil (see the module documentation).
+"""
+function CellListWorkspace{D, T}(n::Integer; reach::Integer = 1, max_cells::Integer = 50_000_000,
                                  deterministic::Bool = true) where {D, T}
+    reach >= 1 || throw(ArgumentError("the cell list reach must be at least 1, got $reach"))
+    R = Int(reach)
     bbox_ws = ReductionWorkspace{SVector{2D, T}}(n)
-    return CellListWorkspace{D, T, typeof(bbox_ws)}(
-        CellGrid{D}(),
-        CuArray([CellGrid{D}()]),
+    return CellListWorkspace{D, T, R, typeof(bbox_ws)}(
+        CellGrid{D, R}(),
+        CuArray([CellGrid{D, R}()]),
         0,
         CuVector{Int32}(undef, 1024),
         CuVector{Int32}(undef, 1024),
@@ -276,17 +348,20 @@ cell id of every particle is written to `dsts[end]` when `srcs[end]` is the
 workspace scratch cell id array, so include `(ws.CellIDScratch => CellID)`
 as the last pair.
 """
-function update_cell_list!(ws::CellListWorkspace{D, T}, Position::CuVector{SVector{D, T}},
-                           InverseCutOff, srcs::Tuple, dsts::Tuple) where {D, T}
+function update_cell_list!(ws::CellListWorkspace{D, T, R}, Position::CuVector{SVector{D, T}},
+                           InverseCutOff, srcs::Tuple, dsts::Tuple) where {D, T, R}
     n = length(Position)
 
-    # Bounding box of all particles -> grid with one cell margin.
+    # Cells have edge H / R: bin with R / H (exact for R = 1, 2).
+    inv_cell = bin_scale(ws.grid, T(InverseCutOff))
+
+    # Bounding box of all particles -> grid with an R cell margin.
     init = SVector{2D, T}(ntuple(k -> k <= D ? T(Inf) : T(-Inf), Val(2D)))
     bbox = reduce_svector(ws.bbox_ws, bbox_map, bbox_reduce, init, n, Position)
     all(isfinite, bbox) || error("Non-finite particle position encountered while building the cell list.")
 
-    cmin = ntuple(d -> map_floor(bbox[d],     InverseCutOff) - Int32(1), Val(D))
-    cmax = ntuple(d -> map_floor(bbox[D + d], InverseCutOff) + Int32(1), Val(D))
+    cmin = ntuple(d -> map_floor(bbox[d],     inv_cell) - Int32(R), Val(D))
+    cmax = ntuple(d -> map_floor(bbox[D + d], inv_cell) + Int32(R), Val(D))
     dims = ntuple(d -> cmax[d] - cmin[d] + Int32(1), Val(D))
     ncells_big = prod(Int64.(dims))
     if ncells_big > ws.max_cells
@@ -295,7 +370,7 @@ function update_cell_list!(ws::CellListWorkspace{D, T}, Position::CuVector{SVect
               "Increase `GPUMaxCells` in SimulationMetaData if this is expected.")
     end
     ncells = Int32(ncells_big)
-    grid   = CellGrid{D}(cmin, dims, ncells)
+    grid   = CellGrid{D, R}(cmin, dims, ncells)
     ws.grid = grid
     fill!(ws.grid_dev, grid)
 
@@ -308,7 +383,7 @@ function update_cell_list!(ws::CellListWorkspace{D, T}, Position::CuVector{SVect
 
     fill!(Counts, Int32(0))
     @cuda threads=threads blocks=blocks cellid_hist_kernel!(ws.CellIDScratch, ws.Counts, Position,
-                                                             T(InverseCutOff), grid, Int32(n))
+                                                             inv_cell, grid, Int32(n))
 
     # Exclusive prefix sum with leading zero.
     fill!(view(ws.CellStart, 1:1), Int32(0))

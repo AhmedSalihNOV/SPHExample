@@ -3,7 +3,10 @@
 # compare against the reference implementation. Invoke from the repository
 # root environment:
 #
-#     julia -t 8,0 --project=. gpu_version/test/cpu_reference.jl <case name> <sim time> <out.h5>
+#     julia -t 8,0 --project=. gpu_version/test/cpu_reference.jl <case name> <sim time> <out.h5> [<scheme>]
+#
+# `<scheme>` (optional) is `SymplecticTimeStepping` (the default of the cases)
+# or `SingleNeighborTimeStepping` and overrides the scheme of the case.
 #
 # (`-t N,0` avoids the interactive thread that Julia 1.12 adds with `-t auto`,
 #  which the CPU code does not account for.)
@@ -19,7 +22,7 @@ using StaticArrays
 include(joinpath(@__DIR__, "..", "benchmark", "cases.jl"))
 
 function main(args)
-    casename, simtime_str, outfile = args
+    casename, simtime_str, outfile = args[1:3]
     idx  = findfirst(c -> c.name == casename, BENCH_CASES)
     idx === nothing && error("Unknown case $(casename)")
     case = BENCH_CASES[idx]
@@ -27,6 +30,12 @@ function main(args)
 
     save = mktempdir()
     kw   = case.build(Float64, save)
+    if length(args) >= 4
+        scheme = args[4] == "SymplecticTimeStepping"     ? SymplecticTimeStepping() :
+                 args[4] == "SingleNeighborTimeStepping" ? SingleNeighborTimeStepping() :
+                 error("Unknown time stepping scheme $(args[4])")
+        kw = merge(kw, (; SimTimeStepping = scheme))
+    end
     kw.SimMetaData.SimulationTime = simtime
     kw.SimMetaData.OutputTimes    = simtime
     particles = AllocateDataStructures(kw.SimGeometry, kw.SimMetaData)

@@ -41,12 +41,16 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
     `UniqueCells` from the SPH cell list.  Returns `(points, connectivity,
     offsets, cell_types, cell_data, dims)` where `dims` is 2 or 3.
     """
-    function compute_grid_geometry(SimKernel, UniqueCells)
+    # Edge length of the exported cells: `H` divided by the number of cells
+    # per support radius of the GPU grid (`GPUCellSubdivision`).
+    grid_cell_edge(SimKernel, SimMetaData) = SimKernel.H / SimMetaData.GPUCellSubdivision
+
+    function compute_grid_geometry(cell_edge::Real, UniqueCells)
         ExtractDimensionality(::AbstractVector{CartesianIndex{N}}) where N = N
 
         dims = ExtractDimensionality(UniqueCells)
 
-        dx = dy = dz = SimKernel.H
+        dx = dy = dz = cell_edge
 
         if dims == 2
             minx, maxx = minimum(ci -> ci[1], UniqueCells), maximum(ci -> ci[1], UniqueCells)
@@ -322,8 +326,8 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
         end
     end
 
-    function AppendVTKHDFGridData(root, newStep, SimKernel, UniqueCells, SimParticles)
-        points, connectivity, offsets, cell_types, cell_data, _ = compute_grid_geometry(SimKernel, UniqueCells)
+    function AppendVTKHDFGridData(root, newStep, cell_edge::Real, UniqueCells, SimParticles)
+        points, connectivity, offsets, cell_types, cell_data, _ = compute_grid_geometry(cell_edge, UniqueCells)
         vtk_type = first(cell_types)
 
         
@@ -406,8 +410,8 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
         return nothing
     end
 
-    function SaveCellGridVTKHDF(FilePath, SimKernel, UniqueCells)
-        points, connectivity, offsets, cell_types, cell_data, _ = compute_grid_geometry(SimKernel, UniqueCells)
+    function SaveCellGridVTKHDF(FilePath, cell_edge::Real, UniqueCells)
+        points, connectivity, offsets, cell_types, cell_data, _ = compute_grid_geometry(cell_edge, UniqueCells)
 
         # Open HDF5 file for writing
         io = h5open(FilePath, "w")
@@ -545,10 +549,11 @@ export SaveVTKHDF, GenerateGeometryStructure, GenerateStepStructure,
         function save_cell_grid(iteration, cells, SimParticles, time = SimMetaData.TotalTime)
             if SimMetaData.ExportGridCells
                 isempty(cells) && return nothing
+                cell_edge = grid_cell_edge(SimKernel, SimMetaData)
                 if !SimMetaData.ExportSingleVTKHDF
-                    SaveCellGridVTKHDF(grid_filename(iteration), SimKernel, cells)
+                    SaveCellGridVTKHDF(grid_filename(iteration), cell_edge, cells)
                 else 
-                    AppendVTKHDFGridData(root_grid, time, SimKernel, cells, SimParticles)
+                    AppendVTKHDFGridData(root_grid, time, cell_edge, cells, SimParticles)
                 end
             end
         end

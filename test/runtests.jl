@@ -214,13 +214,6 @@ end
     @test GravityCoarseMetaData.TimeSteps == GravityFineMetaData.TimeSteps
     @test GravityCoarseState == GravityFineState
 
-    @test !SPHExample.SPHCellList.NeedsSingleNeighborCorrection(0, false)
-    @test !SPHExample.SPHCellList.NeedsSingleNeighborCorrection(19, false)
-    @test SPHExample.SPHCellList.NeedsSingleNeighborCorrection(20, false)
-    @test !SPHExample.SPHCellList.NeedsSingleNeighborCorrection(20, true)
-    @test !SPHExample.SPHCellList.NeedsSingleNeighborCorrection(21, false)
-    @test SPHExample.SPHCellList.NeedsSingleNeighborCorrection(40, false)
-
     CorrectionCoarseMetaData, CorrectionCoarseState, _ = RunOutputCadenceCase(
         3 // 4;
         SimulationEnd=3 // 4,
@@ -230,19 +223,8 @@ end
         SimulationEnd=3 // 4,
     )
     @test CorrectionCoarseMetaData.Iteration == CorrectionFineMetaData.Iteration
-    @test CorrectionCoarseMetaData.Iteration >
-          SPHExample.SPHCellList.SingleNeighborCorrectionInterval
     @test CorrectionCoarseMetaData.TimeSteps == CorrectionFineMetaData.TimeSteps
     @test CorrectionCoarseState == CorrectionFineState
-    @test TimerOutputs.ncalls(
-        CorrectionCoarseMetaData.HourGlass["00 Simulation Step"]["04 Periodic Single-Neighbor Correction"],
-    ) == 1
-    @test TimerOutputs.ncalls(
-        CorrectionFineMetaData.HourGlass["00 Simulation Step"]["04 Periodic Single-Neighbor Correction"],
-    ) == 1
-    @test TimerOutputs.ncalls(
-        CorrectionCoarseMetaData.HourGlass["00 Simulation Step"]["04 Periodic Single-Neighbor Correction"]["03 NeighborLoop"],
-    ) == 1
 
     ScheduleMetaData = SimulationMetaData{2, Float64}(
         SimulationName="output_schedule",

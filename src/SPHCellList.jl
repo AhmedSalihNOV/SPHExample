@@ -26,14 +26,6 @@ using StaticArrays: SMatrix, SVector
 using StructArrays: StructArray
 using TimerOutputs: @timeit, flatten
 
-    # Single-neighbor stepping reuses the derivative evaluated at the previous
-    # half state. Re-anchor that carried derivative periodically at an accepted
-    # full state to suppress its long-time parasitic mode. Twenty steps is the
-    # coarsest tested interval that retained the stable StillWedge hydrostatic
-    # result; 40 and 80 steps left progressively more drift. This cadence belongs
-    # to the integrator and must remain independent of output scheduling.
-    const SingleNeighborCorrectionInterval = 20
-
     const ParticleBatchSize = 64
 
     # Spatially sorted particles can give contiguous thread partitions very
@@ -60,13 +52,6 @@ using TimerOutputs: @timeit, flatten
             end
         end
         return nothing
-    end
-
-    @inline function NeedsSingleNeighborCorrection(Iteration::Integer,
-                                                    RefreshedAfterRebuild::Bool)
-        return !RefreshedAfterRebuild &&
-               Iteration > 0 &&
-               mod(Iteration, SingleNeighborCorrectionInterval) == 0
     end
 
     # Reciprocal densities of the evaluated state are shared by every pair of a
@@ -1101,7 +1086,6 @@ using TimerOutputs: @timeit, flatten
             NextOutputTime = next_output_time(SimMetaData)
             while SimMetaData.TotalTime < SimMetaData.SimulationTime
                 @timeit SimMetaData.HourGlass "00 Simulation Step" begin
-                    RefreshedSingleNeighborDerivative = false
                     if !isfinite(ProposedDt) || ProposedDt <= zero(ProposedDt)
                         throw(DomainError(ProposedDt, "the proposed simulation timestep must be finite and positive"))
                     end
@@ -1149,10 +1133,14 @@ using TimerOutputs: @timeit, flatten
                             copyto!(Positionₙ⁺, SimParticles.Position)
                             UpdateMDBCNeighborCache!(MDBCNeighbors, SimKernel, SimParticles, UniqueCellsView)
 
-                            # Single-neighbor stepping carries a midpoint derivative
-                            # into the next predictor. Re-anchor it at this accepted
-                            # full state after a real sort, not after an output event,
-                            # so the arrays stay particle-aligned.
+                            # Single-neighbor stepping carries the corrector derivative
+                            # (dρdtI and Acceleration) into the next predictor. The sort
+                            # permutes SimParticles but not dρdtI, so re-evaluate both at
+                            # this accepted full state. Together with the initial evaluation
+                            # this is the only refresh of the carried derivative, matching
+                            # the GPU solver; a periodic re-anchoring was measured to be
+                            # unnecessary (StillWedge, 4 s: no drift relative to the
+                            # symplectic scheme without it).
                             if TimeSteppingMode isa SingleNeighborTimeStepping
                                 @timeit SimMetaData.HourGlass "03a Rebuild MDBC" ApplyMDBCBeforeHalf!(SimMetaData, SimKernel, SimConstants, SimParticles, ParticleRanges, UniqueCells, MDBCNeighbors)
                                 @timeit SimMetaData.HourGlass "03b Rebuild Pressure" Pressure!(SimParticles.Pressure, SimParticles.Density, SimConstants)
@@ -1161,26 +1149,8 @@ using TimerOutputs: @timeit, flatten
                                     SimConstants, SimParticles, ParticleRanges, CellListIndices,
                                     NeighborCellLists, dρdtI, SimParticles.Acceleration, ∇Cᵢ, ∇◌rᵢ, AccelerationNormSquared, InvDensity = InvDensity,
                                 )
-                                RefreshedSingleNeighborDerivative = true
                             end
                         end
-                    end
-
-                    if TimeSteppingMode isa SingleNeighborTimeStepping &&
-                       NeedsSingleNeighborCorrection(
-                           SimMetaData.Iteration,
-                           RefreshedSingleNeighborDerivative,
-                       )
-                        @timeit SimMetaData.HourGlass "04 Periodic Single-Neighbor Correction" begin
-                            @timeit SimMetaData.HourGlass "01 MDBC" ApplyMDBCBeforeHalf!(SimMetaData, SimKernel, SimConstants, SimParticles, ParticleRanges, UniqueCells, MDBCNeighbors)
-                            @timeit SimMetaData.HourGlass "02 Pressure" Pressure!(SimParticles.Pressure, SimParticles.Density, SimConstants)
-                            @timeit SimMetaData.HourGlass "03 NeighborLoop" EvaluateInteractions!(InteractionWorkspace,
-                                SimDensityDiffusion, SimViscosity, SimKernel, SimMetaData,
-                                SimConstants, SimParticles, ParticleRanges, CellListIndices,
-                                NeighborCellLists, dρdtI, SimParticles.Acceleration, ∇Cᵢ, ∇◌rᵢ, AccelerationNormSquared, InvDensity = InvDensity,
-                            )
-                        end
-                        RefreshedSingleNeighborDerivative = true
                     end
 
                     @timeit SimMetaData.HourGlass "Motion"                                   ProgressMotion(SimParticles, dt₂, MotionDefinition, SimMetaData)

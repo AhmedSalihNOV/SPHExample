@@ -279,13 +279,14 @@ change the integration sequence.
 `SimulationMetaData.TimeSteps` records every accepted physical timestep, rather
 than one sample per output frame.
 
-`SingleNeighborTimeStepping` periodically re-evaluates its carried derivative
-from the accepted full state every 20 physical steps. This suppresses the
-long-time staggered drift without changing the requested simulation inputs, and
-the correction cadence is based only on integration steps, never output events.
-It adds one neighbor evaluation on correction steps (about 5% at this interval);
-a derivative refresh caused by a neighbor-list rebuild satisfies the same
-correction and is not duplicated.
+`SingleNeighborTimeStepping` carries the corrector derivative (`dρdtI` and the
+acceleration) of one step into the predictor of the next. It is evaluated at the
+accepted full state only before the first step and after every neighbor-list
+rebuild, exactly as in the GPU solver. A periodic re-evaluation every 20 steps
+used to be applied as well; a 4 s StillWedge (mDBC) comparison showed no drift
+without it (density differences to the 20-step variant at roundoff level, both
+converging to the symplectic result), so it was removed. Output events never
+touch the carried derivative.
 
 A snapshot is taken from the first completed timestep at or after each deadline.
 The file therefore records the state's actual simulation time, which can be

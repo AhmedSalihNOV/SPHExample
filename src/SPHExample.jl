@@ -1,5 +1,6 @@
 module SPHExample
 
+    include("SPHThreadPool.jl")
     include("AuxiliaryFunctions.jl");
     include("SPHKernels.jl")
     include("SPHViscosityModels.jl")      

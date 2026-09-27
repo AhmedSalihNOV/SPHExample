@@ -16,8 +16,9 @@ using ..SPHKernels
 using ..SPHViscosityModels
 using ..SPHDensityDiffusionModels
 using ..SPHNeighborList: BuildNeighborCellLists!, ComputeCellNeighborCounts, ComputeCellParticleCounts, ConstructStencil, ExtractCells!, FindCellIndex, MapFloor, NeighborParticleRanges, NeighborSortScratch, PackedNeighborCellLists, UpdateNeighbors!, UpdateΔx!
+using ..SPHThreadPool: ForEachIndex!, ForEachWorker!, WorkerCount
 
-using Base.Threads: @threads, nthreads, Atomic, atomic_add!
+using Base.Threads: Atomic, atomic_add!
 using Bumper: @alloc, @no_escape
 using FastPow: @fastpow
 using LinearAlgebra: det, dot, norm
@@ -32,25 +33,10 @@ using TimerOutputs: @timeit, flatten
     # different amounts of work, especially for MDBC's sparse ghost points.
     # Workers take small contiguous batches while each particle retains its
     # original neighbor order and owns all of its accumulator writes.
-    # @threads joins every worker before returning or propagating exceptions,
+    # The pool joins every worker before returning or propagating exceptions,
     # keeping the caller's Bumper buffers alive for the entire computation.
     @inline function ForEachParticle!(Body::F, Indices::AbstractUnitRange) where {F}
-        if nthreads(:default) == 1 || length(Indices) <= ParticleBatchSize
-            for Index in Indices
-                Body(Index)
-            end
-        else
-            NextBatch = Atomic{Int}(first(Indices))
-            @threads for Worker in 1:nthreads(:default)
-                BatchStart = atomic_add!(NextBatch, ParticleBatchSize)
-                while BatchStart <= last(Indices)
-                    for Index in BatchStart:min(BatchStart + ParticleBatchSize - 1, last(Indices))
-                        Body(Index)
-                    end
-                    BatchStart = atomic_add!(NextBatch, ParticleBatchSize)
-                end
-            end
-        end
+        ForEachIndex!(Body, Indices, ParticleBatchSize)
         return nothing
     end
 
@@ -83,7 +69,7 @@ using TimerOutputs: @timeit, flatten
     end
 
     function SymmetricAccumulators(Position::AbstractVector{SVector{D,T}}) where {D,T}
-        Slots = nthreads(:default)
+        Slots = WorkerCount()
         Slots > 1 || return SymmetricAccumulators(Vector{T}[], Vector{SVector{D,T}}[])
         return SymmetricAccumulators([Vector{T}(undef, length(Position)) for _ in 1:Slots],
                                      [Vector{SVector{D,T}}(undef, length(Position)) for _ in 1:Slots])
@@ -97,7 +83,7 @@ using TimerOutputs: @timeit, flatten
 
     # Single-cell batches balance small grids best; larger grids amortise the
     # shared counter over more cells per batch.
-    @inline SymmetricCellBatchSize(CellCount) = max(1, cld(CellCount, 64 * nthreads(:default)))
+    @inline SymmetricCellBatchSize(CellCount) = max(1, cld(CellCount, 64 * WorkerCount()))
 
     function EvaluateInteractions!(Workspace::SymmetricAccumulators, SimDensityDiffusion, SimViscosity, SimKernel,
                                    SimMetaData::SimulationMetaData{D,T,NoShifting,NoKernelOutput,B,L}, SimConstants, SimParticles, ParticleRanges,
@@ -110,7 +96,7 @@ using TimerOutputs: @timeit, flatten
         FillInverseDensity!(InvDensity, Density)
         CellCount = length(NeighborCellLists)
         Slots = length(Workspace.DensityRate)
-        if Slots <= 1 || nthreads(:default) == 1
+        if Slots <= 1
             fill!(dρdtI, zero(eltype(dρdtI)))
             fill!(Acceleration, zero(eltype(Acceleration)))
             SymmetricCells!(SimDensityDiffusion, SimViscosity, SimKernel, SimMetaData, SimConstants,
@@ -124,7 +110,7 @@ using TimerOutputs: @timeit, flatten
 
         Batch = SymmetricCellBatchSize(CellCount)
         NextBatch = Atomic{Int}(1)
-        @threads for Slot in 1:Slots
+        ForEachWorker!() do Slot, _Workers
             DensityRateSlot = Workspace.DensityRate[Slot]
             AccelerationSlot = Workspace.Acceleration[Slot]
             resize!(DensityRateSlot, length(Position))
@@ -142,7 +128,7 @@ using TimerOutputs: @timeit, flatten
         end
 
         # Sum the private copies; each particle is written by exactly one worker.
-        @threads for i in eachindex(Position)
+        ForEachParticle!(eachindex(Position)) do i
             dρdt_acc = zero(eltype(dρdtI))
             acc_acc = zero(eltype(Acceleration))
             @inbounds for Slot in 1:Slots

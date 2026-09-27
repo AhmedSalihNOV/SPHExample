@@ -7,6 +7,7 @@ using TimerOutputs
 
 include("neighbor_sort.jl")
 include("packed_neighbors.jl")
+include("thread_pool.jl")
 include("particle_batches.jl")
 include("interaction_reference.jl")
 include("symmetric_interactions.jl")

@@ -32,6 +32,15 @@ const ThreadPool = SPHExample.SPHThreadPool
         end
     end
 
+    @testset "the pool never oversubscribes a core" begin
+        # Workers spin between regions, so a second worker on a core that
+        # already has one costs more than it contributes.
+        Workers = ThreadPool.WorkerCount()
+        @test 1 <= Workers <= Threads.nthreads(:default)
+        @test Workers <= ThreadPool.PhysicalCoreCount()
+        @test ThreadPool.PhysicalCoreCount() >= 1
+    end
+
     @testset "every worker index is used exactly once" begin
         Workers = ThreadPool.WorkerCount()
         Visits = [Threads.Atomic{Int}(0) for _ in 1:Workers]

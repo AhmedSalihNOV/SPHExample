@@ -7,9 +7,9 @@
 #
 # The top wall has a prescribed horizontal velocity but does not translate out
 # of the cavity (`MoveParticles = false`). The lid spans the outside width of
-# the tank to overlap both side walls. mDBC, density diffusion and shifting
-# keep the fluid coupled to the lid throughout the run. The default duration
-# is the 60 s specified by ANSYS. Optional arguments are
+# the tank to overlap both side walls. Updated mDBC, density diffusion and
+# shifting keep the fluid coupled to the lid throughout the run. The default
+# duration is the 60 s specified by ANSYS. Optional arguments are
 # [save_dir] [dx] [duration] [input_dir].
 using SPHExampleGPU
 using StaticArrays: SVector
@@ -23,7 +23,8 @@ include(joinpath(@__DIR__, "GenerateLidDrivenCavity2D.jl"))
         open_log_file = true, mdbc = true, shifting = true,
         density_diffusion = true, input_dir, save_location)
 
-Run the Re = 100 cavity with particles and ghost nodes generated in memory. Set `mdbc`, `shifting`, or
+Run the Re = 100 cavity with particles and ghost nodes generated in memory.
+`mdbc = true` selects `UpdatedMDBC`; set `mdbc`, `shifting`, or
 `density_diffusion` to false to disable those options. Returns the final
 `particles` and `meta`.
 """
@@ -51,17 +52,15 @@ function run_lid_driven_cavity_2d(;
     T = FloatType
     SimConstants = lid_driven_cavity_2d_constants(T; dx)
     shapes = lid_driven_cavity_2d_shapes()
-    regions = [
-        ParticleRegion("Fixed", shapes.walls, Fixed),
-        ParticleRegion("Lid", shapes.lid, Moving),
-        ParticleRegion("Fluid", shapes.fluid, Fluid),
-    ]
-    sampled = sample_particles(regions, dx)
+    sampled = sample_lid_driven_cavity_regions(shapes, dx)
     simulation_geometry = map(enumerate(sampled)) do (marker, region)
         positions = region.positions
         particles = if region.type != Fluid
+            surface = region.type == Moving ? :lid : :fixed
             ghosts = [
-                SVector{2, Float64}(lid_driven_cavity_ghost_node(x, dx)) for x in positions
+                SVector{2, Float64}(
+                    lid_driven_cavity_ghost_node(x, dx; surface = surface),
+                ) for x in positions
             ]
             particle_struct_array(
                 positions,
@@ -91,7 +90,7 @@ function run_lid_driven_cavity_2d(;
     end
 
     mkpath(save_location)
-    BMode = mdbc ? SimpleMDBC : NoMDBC
+    BMode = mdbc ? UpdatedMDBC : NoMDBC
     SMode = shifting ? PlanarShifting : NoShifting
     meta = SimulationMetaData{2, T, SMode, NoKernelOutput, BMode, StoreLog}(
         SimulationName = "LidDrivenCavity2D",

@@ -40,6 +40,9 @@ include(joinpath(@__DIR__, "..", "example", "LidDrivenCavity2d.jl"))
                   for i in eachindex(regions) for j in (i + 1):length(regions))
         @test all(p -> -0.05 - 1e-12 <= p[1] <= 1.05 + 1e-12, lid.positions)
         @test all(p -> 1 - 1e-12 <= p[2] <= 1.05 + 1e-12, lid.positions)
+        shared_corner = SVector(0.0, 1.0)
+        @test shared_corner in lid.positions
+        @test !(shared_corner in fixed.positions)
         @test all(p -> 0 < p[1] < 1 && 0 < p[2] < 1, fluid.positions)
         @test all(p -> any(isapprox(p[1] / dx, k; atol = 1e-6) for k in -2:22) &&
                        any(isapprox(p[2] / dx, k; atol = 1e-6) for k in -2:22),
@@ -52,12 +55,20 @@ include(joinpath(@__DIR__, "..", "example", "LidDrivenCavity2d.jl"))
             LoadBoundaryNormals(Val(2), Float64, "$(prefix)_GhostNodes.csv")
         @test length(ghosts) == length(walls)
         @test all(points[k] ≈ SVector(walls[k]...) for k in eachindex(walls))
-        @test all(g -> 0 < g[1] < 1 && 0 < g[2] < 1, ghosts)
+        @test all(g -> all(isfinite, g), ghosts)
         @test all(k -> ghosts[k] == points[k] + normals[k], eachindex(ghosts))
+        upper_fixed = findall(p -> p[2] > 1, fixed.positions)
+        @test all(k -> iszero(normals[k][2]), upper_fixed)
+        lid_offset = length(fixed.positions)
+        @test all(k -> iszero(normals[lid_offset + k][1]), eachindex(lid.positions))
         @test lid_driven_cavity_ghost_node((0.0, 0.5), dx) == (dx, 0.5)
         @test SVector(lid_driven_cavity_ghost_node((1.05, 0.5), dx)...) ≈ SVector(0.9, 0.5)
         @test SVector(lid_driven_cavity_ghost_node((0.5, 1.0), dx)...) ≈ SVector(0.5, 0.95)
         @test SVector(lid_driven_cavity_ghost_node((-0.05, -0.05), dx)...) ≈ SVector(0.1, 0.1)
+        @test SVector(lid_driven_cavity_ghost_node((-0.05, 1.0), dx; surface = :lid)...) ≈
+              SVector(-0.05, 0.95)
+        @test SVector(lid_driven_cavity_ghost_node((0.0, 1.05), dx; surface = :fixed)...) ≈
+              SVector(0.05, 1.05)
         geometry = [
             SPHGeometry{2, Float32}(CSVFile = "$(prefix)_Fixed.csv",
                                     GroupMarker = 1, Type = Fixed),
@@ -75,6 +86,8 @@ include(joinpath(@__DIR__, "..", "example", "LidDrivenCavity2d.jl"))
             output_interval = 0.5, visualize = false, open_log_file = false,
             input_dir, save_location = save_dir)
         particles = result.particles
+        @test result.meta isa SimulationMetaData{2, Float32, PlanarShifting,
+                                                  NoKernelOutput, UpdatedMDBC, StoreLog}
 
         lid_indices = findall(==(Moving), particles.Type)
         @test !isempty(lid_indices)
@@ -87,7 +100,7 @@ include(joinpath(@__DIR__, "..", "example", "LidDrivenCavity2d.jl"))
                        0 < particles.Position[i][2] < 1, fluid_indices)
         @test all(i -> 8 < particles.Density[i] < 12, fluid_indices)
         boundary_indices = findall(!=(Fluid), particles.Type)
-        @test all(i -> 10 <= particles.Density[i] < 12, boundary_indices)
+        @test all(i -> 8 < particles.Density[i] < 12, boundary_indices)
     end
 end
 

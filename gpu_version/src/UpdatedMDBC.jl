@@ -37,9 +37,7 @@ end
         return reference_density
     end
     density = b[1] / weight
-    if weight < T(0.1)
-        density = max(reference_density, density)
-    elseif abs(det(A)) >= T(0.001)
+    if weight >= T(0.1) && abs(det(A)) >= T(0.001)
         inverse = inv(A)
         condition = dx^2 * mdbc_matrix_norm(A) * mdbc_matrix_norm(inverse)
         if isfinite(condition) && condition <= T(50)

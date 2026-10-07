@@ -45,8 +45,9 @@ SimMetaData = SimulationMetaData{2, Float32, NoShifting, NoKernelOutput, Updated
 )
 ```
 
-Use `SimpleMDBC` in the same position to retain the original method. Existing
-examples continue to select their original mode. Both mDBC modes accept
+Use `SimpleMDBC` in the same position to retain the original method. The
+LidDriven cavity opts into `UpdatedMDBC` by default; other examples retain their
+existing mode. Both mDBC modes accept
 `ParticleNormalsPath`, or generated `GhostPoints` and `GhostNormals`. The updated
 mode requires valid ghost data for every wall particle. As elsewhere in this
 package, `GhostNormals` stores the displacement from boundary to ghost, not just
@@ -60,8 +61,9 @@ a unit direction. Translating walls reconstruct their ghosts from that displacem
   The details omitted by the slides follow the
   [DualSPHysics mDBC2 implementation](https://github.com/DualSPHysics/DualSPHysics/blob/master/src/source/JSphCpu_mdbc.cpp):
   support threshold `0.1`, determinant threshold `0.001`, and scaled infinity-norm
-  condition number `dx² ‖A‖∞ ‖A⁻¹‖∞ ≤ 50`. Very low support uses a reference-density
-  floor on the Shepard estimate before cloning.
+  condition number `dx² ‖A‖∞ ‖A⁻¹‖∞ ≤ 50`. Low support uses the unmodified
+  Shepard estimate before pressure cloning, so negative boundary pressure is
+  not removed by a reference-density floor.
 * Pressure cloning from ghost density and the normal component of gravity minus
   prescribed wall acceleration. Displacement is `xb - xg`, as in the reference
   implementation, so pressure increases towards a submerged bottom wall.

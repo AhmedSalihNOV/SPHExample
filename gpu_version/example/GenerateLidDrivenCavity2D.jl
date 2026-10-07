@@ -48,6 +48,19 @@ function lid_driven_cavity_2d_shapes(;
     return (; walls, lid, fluid)
 end
 
+function sample_lid_driven_cavity_regions(shapes, dx)
+    sampled = sample_particles(
+        [
+            ParticleRegion("Lid", shapes.lid, Moving),
+            ParticleRegion("Fixed", shapes.walls, Fixed),
+            ParticleRegion("Fluid", shapes.fluid, Fluid),
+        ],
+        dx,
+    )
+    sort!(sampled; by = region -> region.type == Fixed ? 1 : region.type == Moving ? 2 : 3)
+    return sampled
+end
+
 """
     lid_driven_cavity_2d_constants(::Type{T} = Float64; dx = 0.01)
 
@@ -74,15 +87,26 @@ function lid_driven_cavity_2d_constants(
 end
 
 """
-    lid_driven_cavity_ghost_node(x, dx; side_length = 1.0)
+    lid_driven_cavity_ghost_node(x, dx; side_length = 1.0, surface = :all)
 
-Mirror a wall particle across the nearest wetted face into the cavity. At
-corners both coordinates are mirrored, placing the ghost node on the fluid
-side of both faces.
+Mirror a wall particle across the wetted face into the cavity. `:fixed` mirrors
+the side and bottom faces, `:lid` mirrors only the top face, and `:all` mirrors
+both coordinates at corners.
 """
-function lid_driven_cavity_ghost_node(x, dx; side_length = LID_CAVITY_LENGTH)
+function lid_driven_cavity_ghost_node(
+    x, dx; side_length = LID_CAVITY_LENGTH, surface::Symbol = :all
+)
     mirror(c) = c < dx / 2 ? dx - c : c > side_length - dx / 2 ? 2side_length - dx - c : c
-    return (mirror(x[1]), mirror(x[2]))
+    if surface == :fixed
+        y = x[2] < dx / 2 ? dx - x[2] : x[2]
+        return (mirror(x[1]), y)
+    elseif surface == :lid
+        y = x[2] > side_length - dx / 2 ? 2side_length - dx - x[2] : x[2]
+        return (x[1], y)
+    elseif surface == :all
+        return (mirror(x[1]), mirror(x[2]))
+    end
+    throw(ArgumentError("surface must be :fixed, :lid, or :all"))
 end
 
 """
@@ -96,7 +120,12 @@ function write_ghost_nodes_csv(
     positions;
     first_id::Integer = 0,
     dx::Real,
+    ghost_positions = nothing,
 )
+    ghosts = ghost_positions === nothing ?
+        [lid_driven_cavity_ghost_node(x, dx) for x in positions] : ghost_positions
+    length(ghosts) == length(positions) ||
+        throw(ArgumentError("one ghost position is required for every boundary particle"))
     open(path, "w") do io
         println(
             io,
@@ -104,7 +133,7 @@ function write_ghost_nodes_csv(
             "\"Points:0\",\"Points:1\",\"Points:2\"",
         )
         for (k, x) in enumerate(positions)
-            ghost = lid_driven_cavity_ghost_node(x, dx)
+            ghost = ghosts[k]
             normal = (ghost[1] - x[1], ghost[2] - x[2])
             println(
                 io,
@@ -143,12 +172,7 @@ function generate_lid_driven_cavity_2d(
         throw(ArgumentError("dx must be finite, positive and no larger than the cavity"))
 
     shapes = lid_driven_cavity_2d_shapes()
-    regions = [
-        ParticleRegion("Fixed", shapes.walls, Fixed),
-        ParticleRegion("Lid", shapes.lid, Moving),
-        ParticleRegion("Fluid", shapes.fluid, Fluid),
-    ]
-    sampled = sample_particles(regions, dx)
+    sampled = sample_lid_driven_cavity_regions(shapes, dx)
     particles = map(sampled) do region
         density = fill(SimConstants.ρ₀, length(region.positions))
         (; region..., density)
@@ -166,9 +190,17 @@ function generate_lid_driven_cavity_2d(
             first_id = next_id,
         )
     end
-    wall_positions =
-        reduce(vcat, (region.positions for region in particles if region.type != Fluid))
-    write_ghost_nodes_csv("$(prefix)_GhostNodes.csv", wall_positions; dx)
+    wall_regions = filter(region -> region.type != Fluid, particles)
+    wall_positions = reduce(vcat, (region.positions for region in wall_regions))
+    wall_ghost_positions = reduce(vcat, ([
+        lid_driven_cavity_ghost_node(
+            x, dx; surface = region.type == Moving ? :lid : :fixed,
+        ) for x in region.positions
+    ] for region in wall_regions))
+    write_ghost_nodes_csv(
+        "$(prefix)_GhostNodes.csv", wall_positions; dx,
+        ghost_positions = wall_ghost_positions,
+    )
 
     (; ρ₀, c₀) = SimConstants
     positions = to_3d(reduce(vcat, region.positions for region in particles))
@@ -201,4 +233,3 @@ for region in particles
     @info "$(region.name): $(length(region.positions)) particles"
 end
 @info "Saved LidDrivenCavity2D geometry and particles" output_dir
-

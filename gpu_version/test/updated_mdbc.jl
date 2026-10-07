@@ -14,6 +14,10 @@ using Test, SPHExampleGPU, CUDA, StaticArrays, LinearAlgebra
             matrix = SMatrix{N, N, T}(Diagonal(SVector{N, T}(diag)))
             @test GK.updated_ghost_density(matrix, b, T(1000)) ≈ b[1] / matrix[1, 1]
         end
+        low_support = SMatrix{N, N, T}(Diagonal(SVector{N, T}(
+            ntuple(k -> k == 1 ? T(0.05) : one(T), N))))
+        low_support_rhs = setindex(b, T(45), 1)
+        @test GK.updated_ghost_density(low_support, low_support_rhs, T(1000)) ≈ T(900)
         @test GK.updated_ghost_density(zero(A), b, T(1000)) == T(1000)
         coupled = setindex(A, T(0.2), 1, 2)
         exact = SVector{N, T}(ntuple(k -> k == 1 ? 1001 : 10, N))

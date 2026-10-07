@@ -148,6 +148,34 @@ Boundary normals can still be loaded separately with `ParticleNormalsPath`.
 For `SimpleMDBC` or `UpdatedMDBC`, supplying `GhostPoints` and `GhostNormals` on every boundary
 group also supports a run entirely from memory; cavity and 2D dam break use this.
 
+#### Sampling drawn boundaries for mDBC
+
+`sample_boundary` builds a 2D surface particle set with ghost data from a drawn
+`PolyArea`, `Multi`, or collection of polygons. It resamples each ring instead
+of using every vertex of its drawing tessellation, targets a maximum spacing
+of `dp / 2`, retains sharp corners, and still places at least three particles
+on a closed boundary whose perimeter is shorter than that. Reduce `spacing`
+or `ghost_distance` when a smaller length scale requires it. The geometry
+represents the solid wall: normals point out of that region and into adjacent
+fluid (for a hole, into the hole). `GhostNormals` is the boundary-to-ghost
+displacement, matching the solver convention. Set `offset = dp / 2` to place
+the conforming row that far into the wall while keeping normals aligned with
+the edges; ghost points remain `ghost_distance` beyond the original outline.
+This samples one surface row only; use `sample_particles` separately if a
+filled wall volume is needed, and provide valid ghost data for any additional
+wall-volume particles in an mDBC simulation.
+
+```julia
+boundary = sample_boundary(circle((0.5, 0.5), 0.08), dx; offset = dx / 2)
+wall = SPHGeometry{2, Float32}(
+    Particles = particle_struct_array(boundary.positions, ρ₀;
+        GhostPoints = boundary.ghost_points,
+        GhostNormals = boundary.ghost_normals),
+    GroupMarker = 1,
+    Type = Fixed,
+)
+```
+
 ### Generating a case from polygons (StillWedge 2D)
 
 `example/GenerateStillWedgeMDBC.jl` builds the 2D still wedge case from

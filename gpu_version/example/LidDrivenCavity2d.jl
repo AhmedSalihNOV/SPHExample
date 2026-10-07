@@ -90,7 +90,7 @@ function run_lid_driven_cavity_2d(;
     end
 
     mkpath(save_location)
-    BMode = mdbc ? UpdatedMDBC : NoMDBC
+    BMode = mdbc ? SimpleMDBC : NoMDBC
     SMode = shifting ? PlanarShifting : NoShifting
     meta = SimulationMetaData{2, T, SMode, NoKernelOutput, BMode, StoreLog}(
         SimulationName = "LidDrivenCavity2D",

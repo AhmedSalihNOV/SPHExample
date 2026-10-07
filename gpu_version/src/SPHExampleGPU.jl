@@ -116,7 +116,8 @@ module SPHExampleGPU
            ExtrudedPolygon, prism
 
     using .ParticleGenerator
-    export ParticleRegion, sample_particles, hydrostatic_density, write_particle_csv
+    export ParticleRegion, sample_particles, sample_boundary, hydrostatic_density,
+           write_particle_csv
 
     using .OpenExternalPrograms
     export AutoOpenLogFile, AutoOpenParaview, OpenParaviewFile

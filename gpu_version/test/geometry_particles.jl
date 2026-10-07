@@ -1,5 +1,6 @@
 using Test
 using SPHExampleGPU
+using LinearAlgebra: dot, norm
 using StaticArrays
 using StructArrays
 using Meshes
@@ -111,6 +112,72 @@ end
             Particles = StructArray((Position = [SVector(0., 0.)],)),
             GroupMarker = 1, Type = Fluid)
     end
+end
+
+@testset "MDBC-ready boundary sampling" begin
+    dp = 0.02
+    centre = SVector(0.5, 0.5)
+    boundary = sample_boundary(circle(centre, 0.08), dp)
+    @test length(boundary.positions) < 128
+    @test length(boundary.positions) > 3
+    @test maximum(
+        norm(boundary.positions[mod1(i + 1, length(boundary.positions))] -
+             boundary.positions[i]) for i in eachindex(boundary.positions)
+    ) <= dp / 2 + 1e-12
+    @test all(isapprox(norm(n), dp / 2) for n in boundary.ghost_normals)
+    @test all(boundary.ghost_points[i] ≈
+              boundary.positions[i] + boundary.ghost_normals[i]
+              for i in eachindex(boundary.positions))
+    @test all(dot(boundary.ghost_normals[i], boundary.positions[i] - centre) > 0
+              for i in eachindex(boundary.positions))
+
+    tiny = sample_boundary(circle(centre, 1e-9), dp)
+    @test length(tiny.positions) == 3
+    @test maximum(
+        norm(tiny.positions[mod1(i + 1, length(tiny.positions))] - tiny.positions[i])
+        for i in eachindex(tiny.positions)
+    ) < dp / 2
+    @test all(all(isfinite, n) && norm(n) > 0 for n in tiny.ghost_normals)
+    @test all(dot(tiny.ghost_normals[i], tiny.positions[i] - centre) > 0
+              for i in eachindex(tiny.positions))
+
+    square_boundary = sample_boundary(square((0, 0), 0.1), 0.2)
+    corner = findfirst(==(SVector(0.0, 0.0)), square_boundary.positions)
+    @test corner !== nothing
+    @test square_boundary.ghost_normals[corner] / norm(square_boundary.ghost_normals[corner]) ≈
+          SVector(-1, -1) / sqrt(2)
+
+    inset = sample_boundary(square((0, 0), 1), 0.2;
+                            spacing = 0.1, offset = 0.1, ghost_distance = 0.05)
+    left_mid = findfirst(p -> isapprox(p[1], 0.1) && isapprox(p[2], 0.5),
+                         inset.positions)
+    @test left_mid !== nothing
+    @test inset.ghost_normals[left_mid] ≈ SVector(-0.15, 0.0)
+    @test inset.ghost_points[left_mid][1] ≈ -0.05
+
+    narrow = sample_boundary(
+        polygon([(-1, 0), (-0.5, -0.1), (0, -0.15), (0.5, -0.1), (1, 0),
+                 (0.5, 0.1), (0, 0.15), (-0.5, 0.1)]),
+        10.0,
+    )
+    @test length(narrow.positions) >= 3
+
+    wall = SPHGeometry{2, Float32}(
+        Particles = particle_struct_array(boundary.positions, 1000.0;
+            GhostPoints = boundary.ghost_points,
+            GhostNormals = boundary.ghost_normals),
+        GroupMarker = 1,
+        Type = Fixed,
+    )
+    particles = AllocateDataStructures([wall])
+    @test particles.GhostPoints ≈ SVector{2, Float32}.(boundary.ghost_points)
+    @test particles.GhostNormals ≈ SVector{2, Float32}.(boundary.ghost_normals)
+    @test all(!iszero, particles.GhostPoints)
+    @test_throws ArgumentError sample_boundary(circle(centre, 0.1), 0)
+    @test_throws ArgumentError sample_boundary(circle(centre, 0.1), dp; spacing = 0)
+    @test_throws ArgumentError sample_boundary(circle(centre, 0.1), dp; offset = -dp / 2)
+    @test_throws ArgumentError sample_boundary(circle(centre, dp / 4), dp; offset = dp / 2)
+    @test_throws ArgumentError sample_boundary(prism(circle(centre, 0.1), 0, 1), dp)
 end
 
 include(joinpath(@__DIR__, "..", "example", "GenerateStillWedgeMDBC.jl"))

@@ -14,7 +14,8 @@ outline, so arcs and slanted walls are followed closely at the right spacing,
 while every other region keeps the common lattice.
 """
 
-export ParticleRegion, sample_particles, hydrostatic_density, write_particle_csv
+export ParticleRegion, sample_particles, sample_boundary, hydrostatic_density,
+       write_particle_csv
 
 using LinearAlgebra: norm
 using Meshes
@@ -22,7 +23,8 @@ using StaticArrays
 
 using ..SimulationGeometry: ParticleType, Fluid
 using ..PolygonDrawing: ExtrudedPolygon, normalized_rings, layer_points,
-                        shapes_signed_distance
+                        shapes_signed_distance, spaced_points_with_parameters,
+                        turn_angle, offset_polygon
 
 const PolygonGeometry = Union{PolyArea, Multi}
 const GeometryUnion   = Union{Tuple, AbstractVector}
@@ -218,6 +220,150 @@ conforming_polygons(geometry::PolyArea)      = [geometry]
 conforming_polygons(geometry::Multi)         = reduce(vcat, map(conforming_polygons, parent(geometry)))
 conforming_polygons(geometry::GeometryUnion) = reduce(vcat, map(conforming_polygons, collect(geometry)))
 conforming_polygons(geometry) = unsupported_geometry(geometry)
+
+"""
+    sample_boundary(geometry, dp; spacing = dp / 2, offset = 0,
+                    ghost_distance = dp / 2)
+
+Sample the rings of a 2D polygonal wall and return a named tuple with
+`positions`, `ghost_points` and `ghost_normals`, ready to pass to
+`particle_struct_array` for an mDBC `SPHGeometry`. The geometry may be a
+`PolyArea`, `Multi`, or a tuple/vector of these; holes and all components are
+sampled.
+
+Samples are evenly spaced along each ring, with sharp corners retained. The
+spacing is never greater than `spacing`; every closed ring gets at least three
+samples, even when its perimeter is shorter than the requested spacing. This
+keeps small curves usable while avoiding samples at every vertex of a finely
+tessellated circle.
+
+Normals point out of the filled wall geometry (into the surrounding fluid).
+Positive `offset` moves the sampled row into the wall while keeping its normal
+aligned with the corresponding boundary edge. Ghost points remain
+`ghost_distance` beyond the original wall outline, so the displacement stored
+in `ghost_normals` has length `offset + ghost_distance`. The offset must not
+collapse the geometry.
+`ghost_normals` stores the boundary-to-ghost displacement, not a unit normal,
+and `ghost_points == positions .+ ghost_normals`. The default ghost distance is
+`dp / 2`; `spacing`, `offset` and `ghost_distance` can be adjusted for small
+geometries. This function
+samples the surface only; use `sample_particles` separately if a filled wall
+volume is also needed. Any additional wall-volume particles in an mDBC
+simulation need their own valid ghost data as well.
+
+Only 2D polygonal geometries are supported.
+"""
+function sample_boundary(geometry, dp::Real; spacing::Real = dp / 2,
+                         offset::Real = 0,
+                         ghost_distance::Real = dp / 2)
+    dp = lattice_spacing(dp)
+    (isfinite(dp) && dp > 0) ||
+        throw(ArgumentError("dp must be finite and positive, got $dp"))
+    spacing = lattice_spacing(spacing)
+    (isfinite(spacing) && spacing > 0) ||
+        throw(ArgumentError("spacing must be finite and positive, got $spacing"))
+    offset = lattice_spacing(offset)
+    (isfinite(offset) && offset >= 0) ||
+        throw(ArgumentError("offset must be finite and nonnegative, got $offset"))
+    ghost_distance = lattice_spacing(ghost_distance)
+    (isfinite(ghost_distance) && ghost_distance > 0) ||
+        throw(ArgumentError("ghost_distance must be finite and positive, got $ghost_distance"))
+    geometry_dim(geometry) == 2 ||
+        throw(ArgumentError("sample_boundary supports 2D polygonal geometries only"))
+
+    positions = SVector{2, Float64}[]
+    normals = SVector{2, Float64}[]
+    polygons = conforming_polygons(geometry)
+    if offset > 0
+        polygons = [offset_polygon(polygon, -offset) for polygon in polygons]
+    end
+    for polygon in polygons
+        for ring in normalized_rings(polygon)
+            ring_positions, ring_normals = boundary_ring_samples(ring, spacing)
+            append!(positions, ring_positions)
+            append!(normals, ring_normals)
+        end
+    end
+
+    ghost_normals = [(offset + ghost_distance) * normal for normal in normals]
+    ghost_points = positions .+ ghost_normals
+    return (; positions, ghost_points, ghost_normals)
+end
+
+function boundary_ring_samples(ring, spacing)
+    corners = findall(i -> abs(turn_angle(ring, i)) > CONFORMING_CORNER_ANGLE,
+                      eachindex(ring))
+    positions = SVector{2, Float64}[]
+    normals = SVector{2, Float64}[]
+
+    if length(corners) <= 1
+        start = isempty(corners) ? 1 : only(corners)
+        path_indices = [mod1(start + i, length(ring)) for i in 0:(length(ring) - 1)]
+        path_positions, path_normals =
+            boundary_path_samples(ring, path_indices, spacing; closed = true)
+        return path_positions, path_normals
+    end
+
+    for k in eachindex(corners)
+        start = corners[k]
+        stop = corners[mod1(k + 1, length(corners))]
+        path_indices = [mod1(start + i, length(ring))
+                        for i in 0:mod(stop - start, length(ring))]
+        path_positions, path_normals =
+            boundary_path_samples(ring, path_indices, spacing; closed = false)
+        append!(positions, path_positions[1:(end - 1)])
+        append!(normals, path_normals[1:(end - 1)])
+    end
+    if length(positions) < 3
+        start, stop = corners
+        path_indices = [mod1(start + i, length(ring))
+                        for i in 0:mod(stop - start, length(ring))]
+        path = ring[path_indices]
+        path_length = sum(norm(path[i + 1] - path[i]) for i in 1:(length(path) - 1))
+        extra_positions, extra_normals =
+            boundary_path_samples(ring, path_indices, path_length / 2; closed = false)
+        push!(positions, extra_positions[2])
+        push!(normals, extra_normals[2])
+    end
+    return positions, normals
+end
+
+function boundary_path_samples(ring, path_indices, spacing; closed::Bool)
+    path = ring[path_indices]
+    positions, edges, fractions = spaced_points_with_parameters(
+        path, spacing; closed, ceil_spacing = true, minimum_parts = closed ? 3 : 1,
+    )
+    normals = SVector{2, Float64}[]
+    corner_tolerance = 32 * eps(Float64)
+    for (edge, fraction) in zip(edges, fractions)
+        start_index = path_indices[edge]
+        end_index = path_indices[closed ? mod1(edge + 1, length(path_indices)) : edge + 1]
+        normal = if fraction <= corner_tolerance
+            boundary_vertex_normal(ring, start_index)
+        elseif fraction >= 1 - corner_tolerance
+            boundary_vertex_normal(ring, end_index)
+        else
+            boundary_edge_normal(ring[start_index], ring[end_index])
+        end
+        push!(normals, normal)
+    end
+    return positions, normals
+end
+
+function boundary_edge_normal(a, b)
+    edge = b - a
+    return SVector{2, Float64}(edge[2], -edge[1]) / norm(edge)
+end
+
+function boundary_vertex_normal(ring, i)
+    previous = mod1(i - 1, length(ring))
+    next = mod1(i + 1, length(ring))
+    normal = boundary_edge_normal(ring[previous], ring[i]) +
+             boundary_edge_normal(ring[i], ring[next])
+    magnitude = norm(normal)
+    return magnitude > eps(Float64) ? normal / magnitude :
+           boundary_edge_normal(ring[i], ring[next])
+end
 
 """Points bucketed in square cells of `cell`, to find neighbours within one cell size."""
 struct PointHash{D}

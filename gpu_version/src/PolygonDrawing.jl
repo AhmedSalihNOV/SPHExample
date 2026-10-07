@@ -56,7 +56,9 @@ left_normal(u) = Vec2(-u[2], u[1])
 
 function signed_area(ring::Ring)
     n = length(ring)
-    return sum(cross2(ring[i], ring[mod1(i + 1, n)]) for i in 1:n) / 2
+    origin = ring[1]
+    return sum(cross2(ring[i] - origin, ring[mod1(i + 1, n)] - origin)
+               for i in 1:n) / 2
 end
 
 # Length scale of a set of rings, for relative tolerances.
@@ -64,7 +66,15 @@ function extent(rings)
     points = reduce(vcat, rings)
     lo = reduce((a, b) -> min.(a, b), points)
     hi = reduce((a, b) -> max.(a, b), points)
-    return max(maximum(hi - lo), maximum(abs, hi), maximum(abs, lo), eps())
+    return maximum(hi - lo)
+end
+
+function geometric_tolerance(rings, scale = extent(rings))
+    points = reduce(vcat, rings)
+    lo = reduce((a, b) -> min.(a, b), points)
+    hi = reduce((a, b) -> max.(a, b), points)
+    coordinate_scale = max(maximum(abs, lo), maximum(abs, hi))
+    return max(1e-12 * scale, 4 * eps(coordinate_scale))
 end
 
 """
@@ -74,7 +84,7 @@ closing duplicate when `closed`), so that every edge has a direction.
 function clean_points(points; closed::Bool)
     raw = Vec2[as_vec2(p) for p in points]
     isempty(raw) && return raw
-    tolerance = 1e-12 * extent([raw])
+    tolerance = geometric_tolerance([raw])
     cleaned = Vec2[raw[1]]
     for x in Iterators.drop(raw, 1)
         norm(x - cleaned[end]) > tolerance && push!(cleaned, x)
@@ -139,10 +149,13 @@ function check_simple(rings::Vector{Ring}, what)
     for ring in rings
         length(ring) >= 3 ||
             throw(ArgumentError("$what needs at least three distinct vertices"))
-        abs(signed_area(ring)) > 1e-12 * scale^2 ||
+        ring_scale = extent([ring])
+        abs(signed_area(ring)) > geometric_tolerance([ring], ring_scale) * ring_scale ||
             throw(ArgumentError("$what has zero area"))
     end
 
+    length_tolerance = geometric_tolerance(rings, scale)
+    area_tolerance = length_tolerance * scale
     edges = [(r, i) for (r, ring) in enumerate(rings) for i in eachindex(ring)]
     endpoints(r, i) = (rings[r][i], rings[r][mod1(i + 1, length(rings[r]))])
     adjacent(r, i, s, j) = r == s && (j == mod1(i + 1, length(rings[r])) ||
@@ -152,7 +165,7 @@ function check_simple(rings::Vector{Ring}, what)
         adjacent(r, i, s, j) && continue
         a, b = endpoints(r, i)
         c, d = endpoints(s, j)
-        if segments_meet(a, b, c, d, 1e-12 * scale^2, 1e-12 * scale)
+        if segments_meet(a, b, c, d, area_tolerance, length_tolerance)
             throw(ArgumentError("$what intersects itself; for a wall, reduce the " *
                                 "thickness or offset, or lengthen the short edges"))
         end
@@ -724,13 +737,25 @@ Points splitting the polyline `path` into `round(length / spacing)` (at least
 one) equal parts, both ends included. With `closed = true` the path returns to
 its first point, which is not repeated.
 """
-function spaced_points(path::Ring, spacing; closed::Bool)
+function spaced_points_with_parameters(path::Ring, spacing; closed::Bool,
+                                       ceil_spacing::Bool = false,
+                                       minimum_parts::Integer = 1)
+    minimum_parts >= 1 || throw(ArgumentError("minimum_parts must be at least 1"))
     loop = closed ? vcat(path, [path[1]]) : path
     lengths = [norm(loop[i + 1] - loop[i]) for i in 1:(length(loop) - 1)]
     total = sum(lengths; init = 0.0)
-    total > 0 || return path[1:1]
-    parts = max(1, round(Int, total / spacing))
+    total > 0 || return path[1:1], [1], [0.0]
+    ratio = total / spacing
+    parts = if ceil_spacing
+        (isfinite(ratio) && ratio < typemax(Int)) ||
+            throw(ArgumentError("spacing $spacing requests too many boundary particles"))
+        max(Int(minimum_parts), ceil(Int, ratio))
+    else
+        max(Int(minimum_parts), 1, round(Int, ratio))
+    end
     samples = Vec2[]
+    edges = Int[]
+    fractions = Float64[]
     edge, walked = 1, 0.0
     for k in 0:(closed ? parts - 1 : parts)
         target = total * k / parts
@@ -740,7 +765,14 @@ function spaced_points(path::Ring, spacing; closed::Bool)
         end
         fraction = lengths[edge] > 0 ? clamp((target - walked) / lengths[edge], 0, 1) : 0.0
         push!(samples, loop[edge] + fraction * (loop[edge + 1] - loop[edge]))
+        push!(edges, edge)
+        push!(fractions, fraction)
     end
+    return samples, edges, fractions
+end
+
+function spaced_points(path::Ring, spacing; closed::Bool)
+    samples, _, _ = spaced_points_with_parameters(path, spacing; closed)
     return samples
 end
 

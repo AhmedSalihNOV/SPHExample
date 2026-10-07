@@ -6,6 +6,9 @@
 # FloatType = Float32 is usually 2-4x faster than Float64 on consumer and
 # laptop GPUs (their double precision throughput is low); Float64 reproduces
 # the CPU results to round-off.
+#
+# The mDBC boundary is sampled half a particle spacing inside the drawn wall;
+# edge-aligned normals and ghost points are generated from that geometry.
 using SPHExampleGPU
 include(joinpath(@__DIR__, "GenerateStillWedgeMDBC.jl"))
 
@@ -22,15 +25,15 @@ let
     # SimConstantsWedge = SimulationConstants{FloatType}(dx=0.01,c₀=43.4, δᵩ = 0.1, CFL=0.2)
     #
     polygons = still_wedge_2d_polygons()
-    regions = [
-        ParticleRegion("Bound", polygons.tank, Fixed),
-        ParticleRegion("Fluid", polygons.water, Fluid),
-    ]
-    sampled = sample_particles(regions, SimConstantsWedge.dx)
-    boundary, fluid = sampled
+    dx = SimConstantsWedge.dx
+    boundary = sample_boundary(polygons.tank, dx; offset = dx / 2)
+    fluid = only(sample_particles([
+        ParticleRegion("Fluid", polygons.water, Fluid; offset = dx / 2),
+    ], dx))
     FixedBoundary = SPHGeometry{Dimensions, FloatType}(
-        boundary.positions;
-        Density = SimConstantsWedge.ρ₀,
+        Particles = particle_struct_array(boundary.positions, SimConstantsWedge.ρ₀;
+            GhostPoints = boundary.ghost_points,
+            GhostNormals = boundary.ghost_normals),
         # CSVFile = "input/still_wedge_generated/StillWedge2D_Dp$(SimConstantsWedge.dx)_Bound.csv",
         GroupMarker = 1,
         Type = Fixed,
@@ -49,7 +52,7 @@ let
         FloatType,
         NoShifting,
         NoKernelOutput,
-        NoMDBC,
+        SimpleMDBC,
         StoreLog,
     }(
         SimulationName = "StillWedge",
@@ -100,7 +103,6 @@ let
         SimViscosity = ArtificialViscosity(),
         SimDensityDiffusion = LinearDensityDiffusion(),
         SimTimeStepping = SymplecticTimeStepping(),
-        ParticleNormalsPath = "./input/still_wedge_mdbc/StillWedge_Dp$(SimConstantsWedge.dx)_GhostNodes_Correct.csv",
     )
 
     # This can be used to plot pressure profile results after simulation
@@ -138,4 +140,3 @@ let
 
     # display(plt)
 end
-

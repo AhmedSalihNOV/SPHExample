@@ -1,6 +1,7 @@
 using Test
 using CSV
 using HDF5
+using LinearAlgebra: norm
 using StaticArrays
 
 include(joinpath(@__DIR__, "..", "example", "GenerateStillWedgeMDBC.jl"))
@@ -95,6 +96,32 @@ end
         @test minimum(p -> p[1], grown[1].positions) == -dx
         # zero offset is the default and unchanged
         @test ParticleRegion("Bound", polygons.tank, Fixed).offset == 0
+    end
+
+    @testset "inset mDBC boundary geometry" begin
+        boundary = sample_boundary(polygons.tank, dx; offset = dx / 2)
+        fluid = only(sample_particles([
+            ParticleRegion("Fluid", polygons.water, Fluid; offset = dx / 2),
+        ], dx))
+        @test !isempty(boundary.positions)
+        @test !isempty(fluid.positions)
+        @test length(boundary.positions) == length(boundary.ghost_points) ==
+              length(boundary.ghost_normals)
+        @test all(isapprox(norm(n), dx) for n in boundary.ghost_normals)
+        @test all(boundary.ghost_points[i] ≈
+                  boundary.positions[i] + boundary.ghost_normals[i]
+                  for i in eachindex(boundary.positions))
+
+        wall_geometry = SPHGeometry{2, Float32}(
+            Particles = particle_struct_array(boundary.positions, 1000.0;
+                GhostPoints = boundary.ghost_points,
+                GhostNormals = boundary.ghost_normals),
+            GroupMarker = 1,
+            Type = Fixed,
+        )
+        wall_particles = AllocateDataStructures([wall_geometry])
+        @test all(!iszero, wall_particles.GhostPoints)
+        @test all(!iszero, wall_particles.GhostNormals)
     end
 
     mktempdir() do directory

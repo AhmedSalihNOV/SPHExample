@@ -29,6 +29,8 @@ and files have closed. Its fields are:
   frame), `cell_list_rebuilds`, `grid_dims`, `frozen_particles`,
   `step_state_readbacks`, `grid_status_readbacks`, `capacity_growths`,
   `bbox_host_readbacks`, and `captured_graphs`, all captured at return.
+  With `SimWorkspace`, `workspace_reused` reports allocation reuse and
+  `captured_graphs` is sampled before that run's captures are discarded.
   `periodic_source_rebuilds` counts the separate force-source sorts for the
   periodic-image backend; `periodic_source_count` includes originals and copies
   in its last evaluated state. Both are zero for other backends. The final

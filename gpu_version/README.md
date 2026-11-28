@@ -3858,6 +3858,58 @@ velocity, density, pressure and frame-time differences separately. It requires
 matching step, rebuild and readback counts. See the [measurement notes](benchmark/predictor_fusion.md)
 for results and their limits.
 
+### Reusing GPU workspaces for parameter sweeps
+
+Pass one `GPUWorkspace()` to successive same-shape runs:
+
+```julia
+function run_sweep(inputs)
+    workspace = GPUWorkspace()
+    results = [RunSimulation(; run..., SimWorkspace = workspace) for run in inputs]
+    empty!(workspace)
+    return results
+end
+```
+
+Each element of `inputs` is a named tuple of the usual `RunSimulation` keywords.
+Supply fresh initial host particles, fresh metadata (`TotalTime = Iteration = 0`),
+and a distinct output directory for each run. The workspace copies those initial
+values into its current device buffers, including after earlier runs reordered
+particles. Initial positions, density, velocity, physical constants, kernel
+spacing and output settings can change. Host layout, particle/ghost-owner counts,
+precision, kernel family, CUDA context, metadata mode types, allocation/grid
+settings and interaction launch geometry must match. Incompatible requests throw; `empty!(workspace)` permits a
+new shape. Failed/interrupted runs discard cached storage, so the next valid call
+allocates fresh buffers. Concurrent use is rejected.
+
+The initial supported scope is stationary fixed/fluid geometry, nonperiodic
+`NoMDBC` or `SimpleMDBC`, no shifting, and ordinary symplectic or single-neighbor
+stepping. Diagnostics, motion, floating bodies, variable resolution, external
+forces, damping, cleaning and stage/state callbacks are rejected. Particle,
+predictor/cache, reduction, pair-signal, timestep and grid/scan storage is reused.
+Output staging and empty motion/body structures remain per-run allocations.
+Each run resets device controls/counters and reconstructs
+grid occupancy and fixed-grid bounds, retaining provisioned buffer capacity.
+Graphs are recaptured with the new constants and pointers, then dropped before
+per-run auxiliary data goes out of scope. Result diagnostics retain the observed
+graph counts.
+
+`result.diagnostics.workspace_reused` reports whether storage was reused;
+`workspace.runs` and `workspace.reuses` count completed runs. Results retain their
+separate host particle arrays. `empty!` releases cached references; it does not
+force CUDA allocator reservations to return to the driver.
+
+```sh
+julia --project=. test/workspace_reuse.jl
+julia --project=. benchmark/workspace_reuse.jl
+```
+
+The benchmark alternates warmed fresh/reused runs, checks exact particle/output
+values and matching accepted work, and measures allocation bytes separately from
+unprofiled setup/full-run timings. See [measurement notes](benchmark/workspace_reuse.md).
+This targets setup and allocation churn, not neighbor-pair throughput; requested
+allocation bytes are not peak or reserved VRAM.
+
 ### Compact GPU buffers
 
 The default `GPUCompactBuffers = true` reduces device storage without changing

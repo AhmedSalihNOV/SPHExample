@@ -44,6 +44,7 @@ include(joinpath(@__DIR__, "dual_sphysics_shifting.jl"))
 include(joinpath(@__DIR__, "final_state_caches.jl"))
 include(joinpath(@__DIR__, "reductions.jl"))
 include(joinpath(@__DIR__, "step_state.jl"))
+include(joinpath(@__DIR__, "workspace_reuse.jl"))
 
 include(joinpath(@__DIR__, "batch_commit.jl"))
 include(joinpath(@__DIR__, "reference_force_fusion.jl"))

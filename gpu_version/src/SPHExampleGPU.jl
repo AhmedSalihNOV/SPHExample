@@ -159,7 +159,7 @@ module SPHExampleGPU
 
     using .SPHCellList
     export GPUParticles, GPUSupportArrays, MotionArrays, upload_particles, download_particles!,
-           RunSimulation, SimulationLoop, position_type, uses_pos_cells
+           RunSimulation, GPUWorkspace, SimulationLoop, position_type, uses_pos_cells
 
     using .SimulationResults
     export SimulationResult

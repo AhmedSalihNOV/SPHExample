@@ -9,7 +9,7 @@ written, so the host arrays always hold the most recently written state.
 module SPHCellList
 
 export GPUParticles, GPUSupportArrays, MotionArrays, upload_particles, download_particles!,
-       RunSimulation, SimulationLoop, enqueue_step!, batch_size, position_type, uses_pos_cells
+       RunSimulation, GPUWorkspace, SimulationLoop, enqueue_step!, batch_size, position_type, uses_pos_cells
 
 using CUDA
 using StaticArrays
@@ -2074,12 +2074,15 @@ include("GPUDualSymplecticDriver.jl")
 
 function run_variable_resolution end
 
+include("GPUWorkspace.jl")
+
 """
     RunSimulation(; SimGeometry, SimMetaData, SimConstants, SimKernel, SimLogger,
                     SimParticles, SimViscosity, SimDensityDiffusion, SimTimeStepping,
                     ParticleNormalsPath, SimMeasurements = nothing, SimExternalForces = nothing,
                     SimRotation = nothing,
                     SimMotion = nothing,
+                    SimWorkspace = nothing,
                     ParaviewPressureRange = nothing)
 
 Run a complete simulation on the GPU. Same interface as the CPU version: the
@@ -2098,6 +2101,10 @@ execution and the supported reference physics; see the wave-maker case guide.
 fallback reasons, plus observed graph/direct batch counts. It is available
 with `NoLog` too; `StoreLog` prints the startup configuration before the progress
 table and keeps subsequent configuration reports in the saved log only.
+
+`SimWorkspace = GPUWorkspace()` enables sequential same-shape allocation reuse
+for the supported stationary modes. Supply fresh initial host particles and
+metadata for every call; see [`GPUWorkspace`](@ref) for ownership and reset rules.
 
 `SimMetaData.GPUClipTimeStepToOutput = true` clips adaptive steps to output
 deadlines and ends exactly at `SimulationTime` in the metadata's precision.
@@ -2163,7 +2170,7 @@ scale in Pa. By default use zero through the hydrostatic pressure of the initial
 fluid height plus one particle spacing. This scale stays fixed across frames;
 use an explicit range for impacts or negative pressures.
 """
-function RunSimulation(;SimGeometry::Vector{SPHGeometry{Dimensions, FloatType}},
+function run_simulation!(;SimWorkspace = nothing, SimGeometry::Vector{SPHGeometry{Dimensions, FloatType}},
     SimMetaData::SimulationMetaData{Dimensions, FloatType, SMode, KMode, BMode, LMode},
     SimConstants::SimulationConstants,
     SimKernel::SPHKernelInstance,
@@ -2428,17 +2435,28 @@ function RunSimulation(;SimGeometry::Vector{SPHGeometry{Dimensions, FloatType}},
 
     # Device side data
     @timeit HourGlass "00a Upload To GPU" begin
-        gpu    = upload_particles(SimParticles, SimMetaData)
-        red    = ReductionWorkspace{SVector{3, FloatType}}(NumberOfPoints)
-        divergence_cleaning = CleaningWorkspace(SimDivergenceCleaning,NumberOfPoints,FloatType)
-        diagnostics = SimMetaData.GPUTimestepDiagnosticsEvery == 0 ? nothing :
-            GPUKernels.TimestepDiagnostics{FloatType, eltype(gpu.ID)}(NumberOfPoints)
-        cl     = CellListWorkspace{Dimensions, PositionType}(NumberOfPoints;
-                     reach = SimMetaData.GPUCellSubdivision, x_reach = SimMetaData.GPUXCellSubdivision,
-                     max_cells = SimMetaData.GPUMaxCells,
-                     fixed_grid = SimMetaData.GPUFixedGrid, expansion = SimMetaData.GPUGridExpansion,
-                     periodicity = SimMetaData.Periodicity,
-                     deterministic = SimMetaData.GPUDeterministicSort)
+        workspace_signature_value = SimWorkspace === nothing ? nothing :
+            workspace_signature(SimParticles, SimMetaData, SimKernel, SimTimeStepping)
+        workspace_reused = SimWorkspace !== nothing && SimWorkspace.buffers !== nothing
+        if workspace_reused
+            SimWorkspace.signature == workspace_signature_value ||
+                throw(ArgumentError("GPUWorkspace shape/device/allocation settings changed; use a new workspace or empty! it"))
+            divergence_cleaning = diagnostics = nothing
+            (; gpu, red, cl, sup, state) = SimWorkspace.buffers
+            reset_workspace!(SimWorkspace.buffers, SimParticles, SimMetaData, SimKernel)
+        else
+            gpu    = upload_particles(SimParticles, SimMetaData)
+            red    = ReductionWorkspace{SVector{3, FloatType}}(NumberOfPoints)
+            divergence_cleaning = CleaningWorkspace(SimDivergenceCleaning,NumberOfPoints,FloatType)
+            diagnostics = SimMetaData.GPUTimestepDiagnosticsEvery == 0 ? nothing :
+                GPUKernels.TimestepDiagnostics{FloatType, eltype(gpu.ID)}(NumberOfPoints)
+            cl     = CellListWorkspace{Dimensions, PositionType}(NumberOfPoints;
+                         reach = SimMetaData.GPUCellSubdivision, x_reach = SimMetaData.GPUXCellSubdivision,
+                         max_cells = SimMetaData.GPUMaxCells,
+                         fixed_grid = SimMetaData.GPUFixedGrid, expansion = SimMetaData.GPUGridExpansion,
+                         periodicity = SimMetaData.Periodicity,
+                         deterministic = SimMetaData.GPUDeterministicSort)
+        end
         motion = MotionArrays(SimGeometry, SimParticles)
         rotation = combine_motions(SimRotation, SimMotion, SimGeometry, SimParticles)
         if rotation !== nothing && !(SimTimeStepping isa DualSPHysicsSymplectic)
@@ -2460,15 +2478,19 @@ function RunSimulation(;SimGeometry::Vector{SPHGeometry{Dimensions, FloatType}},
         end
         fuse_predictor = predictor_fusion_enabled(SimMetaData;
             motion, floating, external_forces, rotation, open_boundary)
-        sup = GPUSupportArrays{Dimensions, FloatType}(gpu, SimMetaData; kernel=SimKernel, fuse_predictor)
+        if !workspace_reused
+            sup = GPUSupportArrays{Dimensions, FloatType}(gpu, SimMetaData; kernel=SimKernel, fuse_predictor)
+        end
         if sup.dual_state !== nothing && sup.dual_state.images !== nothing &&
             all(isfinite,SimTimeStepping.domain_min) && all(isfinite,SimTimeStepping.domain_max)
             initialize_periodic_images!(sup.dual_state.images,SimMetaData.Periodicity,SimTimeStepping,SimKernel)
         end
         # Device resident loop state. The displacement bound starts above `h`
         # so that the cell list is built before the first step.
-        state  = StepState{FloatType}(; time = SimMetaData.TotalTime, iteration = SimMetaData.Iteration,
-                                        dx = one(FloatType) + SimKernel.h)
+        if !workspace_reused
+            state = StepState{FloatType}(; time = SimMetaData.TotalTime, iteration = SimMetaData.Iteration,
+                dx = one(FloatType) + SimKernel.h)
+        end
         state.configuration = effective_configuration(SimMetaData, SimKernel, SimDensityDiffusion, SimViscosity;
             particle_count = NumberOfPoints)
         state.configuration = rigid_configuration(state.configuration, floating)
@@ -2478,7 +2500,12 @@ function RunSimulation(;SimGeometry::Vector{SPHGeometry{Dimensions, FloatType}},
         CUDA.synchronize()
     end
 
-    pair_signal = simulation_pair_signal(sup.PairSignal, NumberOfPoints, state.configuration.effective, red.nblocks)
+    pair_signal = workspace_reused ? SimWorkspace.buffers.pair_signal :
+        simulation_pair_signal(sup.PairSignal, NumberOfPoints, state.configuration.effective, red.nblocks)
+    if SimWorkspace !== nothing
+        SimWorkspace.signature = workspace_signature_value
+        SimWorkspace.buffers = (; gpu, red, cl, sup, state, pair_signal)
+    end
     gpu_buffers = (; particles = gpu, support = sup, cells = cl,
         auxiliary = (motion, rotation, external_forces, floating, open_boundary,divergence_cleaning,red.partial, state.f, state.i, state.blocks_done, diagnostics, pair_signal))
 
@@ -2953,8 +2980,18 @@ function RunSimulation(;SimGeometry::Vector{SPHGeometry{Dimensions, FloatType}},
             proposed_limit_ratio_max = clock.proposed_limit_ratio,
             accepted_limit_ratio_max = clock.accepted_limit_ratio,timestep_retries = clock.timestep_retries)))
     end
+    SimWorkspace === nothing || (run_diagnostics = merge(run_diagnostics, (; workspace_reused)))
     termination_reason = run_status == "finished" ? :completed : :interrupted
-    return SimulationResult(final_state, performance, run_diagnostics, termination_reason, configuration_snapshot(state))
+    result = SimulationResult(final_state, performance, run_diagnostics, termination_reason, configuration_snapshot(state))
+    if SimWorkspace !== nothing
+        # Captures also contain per-run auxiliary arguments. Retain only core
+        # storage between runs, after reporting this run's observed graph count.
+        CUDA.synchronize()
+        invalidate_graphs!(state)
+    end
+    return result
 end
+
+@doc (@doc run_simulation!) RunSimulation
 
 end # module
